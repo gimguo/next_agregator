@@ -27,7 +27,9 @@ class V1Controller extends BaseApiController
 {
     /**
      * GET /api/v1/cards
-     * Параметры: page, per-page, status, brand, category_id, search, id
+     * Параметры: page, per-page, status, brand, category_id, search, id, include
+     * include=offers — включить офферы в ответ (для синхронизации)
+     * include=offers,images — включить офферы и картинки
      */
     public function actionCards(): array
     {
@@ -58,6 +60,18 @@ class V1Controller extends BaseApiController
         $search = $request->get('search');
         if ($search) $query->andWhere(['ilike', 'canonical_name', $search]);
 
+        // Eager loading для include
+        $includes = array_filter(explode(',', $request->get('include', '')));
+        $includeOffers = in_array('offers', $includes);
+        $includeImages = in_array('images', $includes);
+
+        if ($includeOffers) {
+            $query->with(['offers.supplier']);
+        }
+        if ($includeImages) {
+            $query->with(['images']);
+        }
+
         $provider = new ActiveDataProvider([
             'query' => $query,
             'pagination' => [
@@ -67,7 +81,50 @@ class V1Controller extends BaseApiController
 
         $cards = [];
         foreach ($provider->getModels() as $card) {
-            $cards[] = $this->serializeCard($card);
+            $cardData = $this->serializeCard($card);
+
+            if ($includeOffers) {
+                $cardData['offers'] = [];
+                foreach ($card->offers as $offer) {
+                    $offerData = [
+                        'supplier_code' => $offer->supplier->code ?? null,
+                        'supplier_name' => $offer->supplier->name ?? null,
+                        'supplier_sku' => $offer->supplier_sku,
+                        'price_min' => $offer->price_min,
+                        'price_max' => $offer->price_max,
+                        'compare_price' => $offer->price_max,
+                        'in_stock' => $offer->in_stock,
+                        'variant_count' => $offer->variant_count,
+                        'is_active' => $offer->is_active,
+                        'updated_at' => $offer->updated_at,
+                    ];
+                    // Включаем variants_json если есть
+                    if ($offer->variants_json) {
+                        $offerData['variants_json'] = is_string($offer->variants_json)
+                            ? json_decode($offer->variants_json, true)
+                            : $offer->variants_json;
+                    }
+                    $cardData['offers'][] = $offerData;
+                }
+            }
+
+            if ($includeImages) {
+                $cardData['images'] = [];
+                $baseUrl = rtrim(Yii::$app->params['appUrl'] ?? '', '/');
+                foreach ($card->images as $img) {
+                    if ($img->status !== 'completed') continue;
+                    $cardData['images'][] = [
+                        'url' => $baseUrl . $img->getDisplayUrl('large'),
+                        'thumb' => $baseUrl . $img->getDisplayUrl('thumb'),
+                        'source_url' => $img->source_url,
+                        'is_main' => $img->is_main,
+                        'width' => $img->width,
+                        'height' => $img->height,
+                    ];
+                }
+            }
+
+            $cards[] = $cardData;
         }
 
         $pagination = $provider->getPagination();
@@ -109,11 +166,13 @@ class V1Controller extends BaseApiController
 
         // Картинки
         $data['images'] = [];
+        $baseUrl = rtrim(Yii::$app->params['appUrl'] ?? '', '/');
         foreach ($card->images as $img) {
             if ($img->status !== 'completed') continue;
             $data['images'][] = [
-                'url' => $img->getDisplayUrl('large'),
-                'thumb' => $img->getDisplayUrl('thumb'),
+                'url' => $baseUrl . $img->getDisplayUrl('large'),
+                'thumb' => $baseUrl . $img->getDisplayUrl('thumb'),
+                'source_url' => $img->source_url,
                 'is_main' => $img->is_main,
                 'width' => $img->width,
                 'height' => $img->height,
@@ -126,6 +185,7 @@ class V1Controller extends BaseApiController
     /**
      * GET /api/v1/updated?since=2026-02-20T00:00:00
      * Карточки обновлённые после указанной даты.
+     * Всегда включает офферы для синхронизации.
      */
     public function actionUpdated(): array
     {
@@ -136,6 +196,7 @@ class V1Controller extends BaseApiController
 
         $query = ProductCard::find()
             ->where(['>=', 'updated_at', $since])
+            ->with(['offers.supplier', 'images'])
             ->orderBy(['updated_at' => SORT_DESC]);
 
         $perPage = min((int)(Yii::$app->request->get('per-page', 100)), 500);
@@ -146,7 +207,38 @@ class V1Controller extends BaseApiController
 
         $cards = [];
         foreach ($provider->getModels() as $card) {
-            $cards[] = $this->serializeCard($card);
+            $cardData = $this->serializeCard($card);
+            $cardData['offers'] = [];
+            foreach ($card->offers as $offer) {
+                $offerData = [
+                    'supplier_code' => $offer->supplier->code ?? null,
+                    'supplier_sku' => $offer->supplier_sku,
+                    'price_min' => $offer->price_min,
+                    'price_max' => $offer->price_max,
+                    'compare_price' => $offer->price_max,
+                    'in_stock' => $offer->in_stock,
+                    'variant_count' => $offer->variant_count,
+                    'is_active' => $offer->is_active,
+                ];
+                if ($offer->variants_json) {
+                    $offerData['variants_json'] = is_string($offer->variants_json)
+                        ? json_decode($offer->variants_json, true)
+                        : $offer->variants_json;
+                }
+                $cardData['offers'][] = $offerData;
+            }
+            $cardData['images'] = [];
+            $baseUrl = rtrim(Yii::$app->params['appUrl'] ?? '', '/');
+            foreach ($card->images as $img) {
+                if ($img->status !== 'completed') continue;
+                $cardData['images'][] = [
+                    'url' => $baseUrl . $img->getDisplayUrl('large'),
+                    'thumb' => $baseUrl . $img->getDisplayUrl('thumb'),
+                    'source_url' => $img->source_url,
+                    'is_main' => $img->is_main,
+                ];
+            }
+            $cards[] = $cardData;
         }
 
         return $this->success($cards, [
