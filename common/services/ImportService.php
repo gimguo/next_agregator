@@ -28,8 +28,9 @@ class ImportService extends Component
         parent::init();
         $this->db = Yii::$app->db;
         if ($this->parserRegistry === null) {
-            $this->parserRegistry = new ParserRegistry();
-            $this->parserRegistry->init();
+            $this->parserRegistry = Yii::$app->has('parserRegistry')
+                ? Yii::$app->get('parserRegistry')
+                : Yii::createObject(ParserRegistry::class);
         }
     }
 
@@ -104,6 +105,13 @@ class ImportService extends Component
         $stats['products_total'] = $totalProducts;
         unset($stats['started_at']);
         $stats['parser'] = $parser->getStats();
+
+        // Обновляем last_import_at для поставщика
+        $this->db->createCommand()->update(
+            '{{%suppliers}}',
+            ['last_import_at' => new \yii\db\Expression('NOW()')],
+            ['code' => $supplierCode]
+        )->execute();
 
         Yii::info("Импорт завершён: " . json_encode($stats, JSON_UNESCAPED_UNICODE), 'import');
 
