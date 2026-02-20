@@ -6,11 +6,14 @@ services:
     volumes:
       - .:/app
       - image_storage:/app/storage/images
+      - ./storage/prices:/app/storage/prices
+      - /home/andrey/projects/ros-matras/console/data/prices:/app/storage/prices-source:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file: .env
     environment:
       - PHP_IDE_CONFIG=serverName=agregator
     networks:
@@ -37,12 +40,14 @@ services:
     volumes:
       - .:/app
       - image_storage:/app/storage/images
-      - price_storage:/app/storage/prices
+      - ./storage/prices:/app/storage/prices
+      - /home/andrey/projects/ros-matras/console/data/prices:/app/storage/prices-source:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file: .env
     restart: unless-stopped
     networks:
       - agregator
@@ -53,12 +58,14 @@ services:
     container_name: agregator-scheduler
     volumes:
       - .:/app
-      - price_storage:/app/storage/prices
+      - ./storage/prices:/app/storage/prices
+      - /home/andrey/projects/ros-matras/console/data/prices:/app/storage/prices-source:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    env_file: .env
     restart: unless-stopped
     command: ["php", "yii", "scheduler/run"]
     networks:
@@ -67,10 +74,11 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: agregator-postgres
+    env_file: .env
     environment:
-      POSTGRES_DB: agregator
-      POSTGRES_USER: agregator
-      POSTGRES_PASSWORD: agregator_secret
+      POSTGRES_DB: ${POSTGRES_DB:-agregator}
+      POSTGRES_USER: ${POSTGRES_USER:-agregator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agregator_secret}
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -119,8 +127,6 @@ volumes:
   redis_data:
     driver: local
   image_storage:
-    driver: local
-  price_storage:
     driver: local
 
 networks:
