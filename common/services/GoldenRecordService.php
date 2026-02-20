@@ -113,9 +113,12 @@ class GoldenRecordService extends Component
      *   - Если атрибуты модели пусты → берём любые
      *   - Иначе → мержим (новые ключи дополняют, но не перезаписывают существующие)
      */
-    public function updateAttributes(int $modelId, int $supplierId, array $newAttributes): void
+    /**
+     * @return bool true если атрибуты были обновлены
+     */
+    public function updateAttributes(int $modelId, int $supplierId, array $newAttributes): bool
     {
-        if (empty($newAttributes)) return;
+        if (empty($newAttributes)) return false;
 
         $db = Yii::$app->db;
 
@@ -156,15 +159,21 @@ class GoldenRecordService extends Component
                 'canonical_attributes' => new JsonExpression($merged ?: new \stdClass()),
                 'updated_at'           => new \yii\db\Expression('NOW()'),
             ], ['id' => $modelId])->execute();
+            return true;
         }
+
+        return false;
     }
 
     /**
      * Обновить описание модели если текущее пустое или короче нового.
      */
-    public function updateDescription(int $modelId, ?string $description, ?string $shortDescription): void
+    /**
+     * @return bool true если описание было обновлено
+     */
+    public function updateDescription(int $modelId, ?string $description, ?string $shortDescription): bool
     {
-        if (empty($description) && empty($shortDescription)) return;
+        if (empty($description) && empty($shortDescription)) return false;
 
         $db = Yii::$app->db;
 
@@ -186,6 +195,9 @@ class GoldenRecordService extends Component
         if (!empty($updates)) {
             $updates['updated_at'] = new \yii\db\Expression('NOW()');
             $db->createCommand()->update('{{%product_models}}', $updates, ['id' => $modelId])->execute();
+            return true;
         }
+
+        return false;
     }
 }

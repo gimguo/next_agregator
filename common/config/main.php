@@ -77,5 +77,22 @@ return [
         'catalogPersister' => [
             'class' => \common\services\CatalogPersisterService::class,
         ],
+
+        // ═══ Transactional Outbox — очередь изменений для синдикации ═══
+        'outbox' => [
+            'class' => \common\services\OutboxService::class,
+            'deduplication' => true,
+        ],
+
+        // ═══ Syndication — трансформация MDM → проекция для витрины ═══
+        'syndicationService' => [
+            'class' => \common\services\RosMatrasSyndicationService::class,
+        ],
+
+        // ═══ Marketplace API Client (мок — пишет в лог) ═══
+        'marketplaceClient' => [
+            'class' => \common\services\marketplace\LogMarketplaceClient::class,
+            'simulateErrors' => false,
+        ],
     ],
 ];

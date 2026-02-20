@@ -39,6 +39,9 @@ class CatalogPersisterService extends Component
     /** @var GoldenRecordService */
     private GoldenRecordService $goldenRecord;
 
+    /** @var OutboxService */
+    private OutboxService $outbox;
+
     /** @var array Статистика текущей сессии */
     private array $stats = [
         'models_created'   => 0,
@@ -56,6 +59,7 @@ class CatalogPersisterService extends Component
         parent::init();
         $this->matcher = Yii::$app->get('matchingService');
         $this->goldenRecord = Yii::$app->get('goldenRecord');
+        $this->outbox = Yii::$app->get('outbox');
     }
 
     /**
@@ -102,6 +106,7 @@ class CatalogPersisterService extends Component
         $action = 'created';
 
         // ═══ МОДЕЛЬ ═══
+        $isNewModel = false;
         if ($modelId) {
             // Модель найдена
             $this->stats['models_matched']++;
@@ -110,9 +115,11 @@ class CatalogPersisterService extends Component
             // Создаём новую модель
             $modelId = $this->createModel($db, $dto, $matchContext);
             $this->stats['models_created']++;
+            $isNewModel = true;
         }
 
         // ═══ ВАРИАНТ ═══
+        $isNewVariant = false;
         if ($variantId) {
             // Вариант найден
             $this->stats['variants_matched']++;
@@ -120,6 +127,7 @@ class CatalogPersisterService extends Component
             // Создаём новый вариант
             $variantId = $this->createVariant($db, $dto, $modelId, $matchContext);
             $this->stats['variants_created']++;
+            $isNewVariant = true;
         }
 
         // ═══ ОФФЕР (UPSERT) ═══
@@ -135,14 +143,53 @@ class CatalogPersisterService extends Component
         $this->goldenRecord->recalculateModel($modelId);
 
         // Обновляем атрибуты модели если нужно
-        $this->goldenRecord->updateAttributes($modelId, $supplierId, $dto->attributes);
-        $this->goldenRecord->updateDescription($modelId, $dto->description, $dto->shortDescription);
+        $attrsUpdated = $this->goldenRecord->updateAttributes($modelId, $supplierId, $dto->attributes);
+        $descUpdated = $this->goldenRecord->updateDescription($modelId, $dto->description, $dto->shortDescription);
+
+        // ═══ OUTBOX — запись событий В ТОЙ ЖЕ ТРАНЗАКЦИИ ═══
+        $offerId = $offerResult['offer_id'];
+
+        if ($isNewModel) {
+            $this->outbox->modelCreated($modelId, $sessionId, [
+                'name'   => $dto->name,
+                'brand'  => $dto->brand,
+                'family' => $matchContext['product_family'] ?? null,
+            ]);
+        } elseif ($attrsUpdated || $descUpdated) {
+            $this->outbox->modelUpdated($modelId, $sessionId);
+        }
+
+        if ($isNewVariant) {
+            $this->outbox->variantCreated($modelId, $variantId, $sessionId, [
+                'label' => $this->buildVariantLabel(
+                    $this->extractVariantAttributes($dto, $matchContext['product_family'] ?? 'unknown'),
+                    $matchContext['product_family'] ?? 'unknown'
+                ),
+            ]);
+        }
+
+        if ($offerResult['is_new']) {
+            $this->outbox->offerCreated($modelId, $variantId, $offerId, $sessionId, [
+                'price' => $dto->getMinPrice(),
+                'supplier_id' => $supplierId,
+            ]);
+        } else {
+            // Оффер обновлён — проверяем изменение цены
+            if ($offerResult['price_changed'] ?? false) {
+                $this->outbox->priceChanged($modelId, $variantId, $offerId, [
+                    'old_price' => $offerResult['old_price'] ?? null,
+                    'new_price' => $dto->getMinPrice(),
+                ], $sessionId);
+            } else {
+                $this->outbox->offerUpdated($modelId, $variantId, $offerId, $sessionId);
+            }
+        }
 
         return [
             'action'     => $action,
             'model_id'   => $modelId,
             'variant_id' => $variantId,
-            'offer_id'   => $offerResult['offer_id'],
+            'offer_id'   => $offerId,
             'matcher'    => $matchResult->matcherName,
             'confidence' => $matchResult->confidence,
         ];
@@ -306,7 +353,7 @@ class CatalogPersisterService extends Component
                 END,
                 is_active = true,
                 updated_at = NOW()
-            RETURNING id, (xmax = 0) AS is_insert
+            RETURNING id, (xmax = 0) AS is_insert, previous_price_min, price_min
         ";
 
         $row = $db->createCommand($sql, [
@@ -328,9 +375,17 @@ class CatalogPersisterService extends Component
             ':raw_data'      => json_encode($dto->rawData, JSON_UNESCAPED_UNICODE),
         ])->queryOne();
 
+        $isNew = (bool)($row['is_insert'] ?? false);
+        $priceChanged = !$isNew
+            && $row['previous_price_min'] !== null
+            && (float)$row['previous_price_min'] !== (float)$row['price_min'];
+
         return [
-            'offer_id' => (int)($row['id'] ?? 0),
-            'is_new'   => (bool)($row['is_insert'] ?? false),
+            'offer_id'      => (int)($row['id'] ?? 0),
+            'is_new'        => $isNew,
+            'price_changed' => $priceChanged,
+            'old_price'     => $isNew ? null : ($row['previous_price_min'] ?? null),
+            'new_price'     => $row['price_min'] ?? null,
         ];
     }
 
