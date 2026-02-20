@@ -89,10 +89,25 @@ return [
             'class' => \common\services\RosMatrasSyndicationService::class,
         ],
 
-        // ═══ Marketplace API Client (RosMatras HTTP) ═══
+        // ═══ Marketplace API Client (RosMatras HTTP) — Legacy single-channel ═══
         'marketplaceClient' => [
             'class' => \common\services\marketplace\RosMatrasApiClient::class,
             // apiUrl и apiToken подтягиваются из params['rosmatras'] в init()
+        ],
+
+        // ═══ Channel Driver Factory — Multi-Channel Syndication ═══
+        'channelFactory' => [
+            'class' => \common\services\channel\ChannelDriverFactory::class,
+            'drivers' => [
+                'rosmatras' => [
+                    'syndicator' => \common\services\channel\drivers\RosMatrasSyndicator::class,
+                    'client'     => \common\services\channel\drivers\RosMatrasChannelClient::class,
+                ],
+                // 'ozon' => [
+                //     'syndicator' => \common\services\channel\drivers\OzonSyndicator::class,
+                //     'client'     => \common\services\channel\drivers\OzonChannelClient::class,
+                // ],
+            ],
         ],
 
         // ═══ DAM — Digital Asset Management (S3/MinIO медиа-пайплайн) ═══

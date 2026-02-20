@@ -11,6 +11,7 @@ use yii\db\ActiveRecord;
  * @property string $entity_type       'model', 'variant', 'offer'
  * @property int    $entity_id
  * @property int    $model_id
+ * @property int    $channel_id        FK → sales_channels
  * @property string $event_type        'created', 'updated', 'deleted', 'price_changed', 'stock_changed'
  * @property array  $payload           JSONB
  * @property string $status            'pending', 'processing', 'success', 'error'
@@ -20,6 +21,9 @@ use yii\db\ActiveRecord;
  * @property string $source
  * @property string $import_session_id
  * @property string $created_at
+ *
+ * @property-read ProductModel  $productModel
+ * @property-read SalesChannel  $salesChannel
  */
 class MarketplaceOutbox extends ActiveRecord
 {
@@ -31,24 +35,30 @@ class MarketplaceOutbox extends ActiveRecord
     public function attributeLabels(): array
     {
         return [
-            'id' => 'ID',
+            'id'          => 'ID',
             'entity_type' => 'Тип сущности',
-            'entity_id' => 'ID сущности',
-            'model_id' => 'ID модели',
-            'event_type' => 'Событие',
-            'payload' => 'Payload',
-            'status' => 'Статус',
+            'entity_id'   => 'ID сущности',
+            'model_id'    => 'ID модели',
+            'channel_id'  => 'Канал продаж',
+            'event_type'  => 'Событие',
+            'payload'     => 'Payload',
+            'status'      => 'Статус',
             'retry_count' => 'Ретраи',
-            'error_log' => 'Лог ошибки',
+            'error_log'   => 'Лог ошибки',
             'processed_at' => 'Обработано',
-            'source' => 'Источник',
+            'source'      => 'Источник',
             'import_session_id' => 'Сессия',
-            'created_at' => 'Создано',
+            'created_at'  => 'Создано',
         ];
     }
 
     public function getProductModel()
     {
         return $this->hasOne(ProductModel::class, ['id' => 'model_id']);
+    }
+
+    public function getSalesChannel()
+    {
+        return $this->hasOne(SalesChannel::class, ['id' => 'channel_id']);
     }
 }

@@ -2,18 +2,25 @@
 
 namespace common\services;
 
+use common\models\SalesChannel;
 use yii\base\Component;
 use yii\db\JsonExpression;
 use Yii;
 
 /**
- * Сервис записи событий в Transactional Outbox.
+ * Сервис записи событий в Transactional Outbox (Multi-Channel Fan-out).
  *
  * Вызывается ВНУТРИ транзакции CatalogPersisterService / GoldenRecordService.
  * Гарантия: INSERT в outbox — часть той же транзакции, что и основная запись.
  *
- * Дедупликация: если для entity уже есть pending-запись с тем же event_type,
- * новая НЕ создаётся (чтобы Worker не обрабатывал одну модель 50 раз).
+ * Fan-out логика:
+ *   При каждом событии (modelUpdated, priceChanged, ...) сервис получает
+ *   список ВСЕХ активных каналов из sales_channels и создаёт запись
+ *   в marketplace_outbox для КАЖДОГО канала.
+ *   Т.е. одно изменение цены → N задач (по одной на каждый канал).
+ *
+ * Дедупликация: если для entity + channel уже есть pending-запись
+ * с тем же event_type, новая НЕ создаётся.
  *
  * Использование:
  *   $outbox = Yii::$app->get('outbox');
@@ -27,10 +34,13 @@ class OutboxService extends Component
 
     /** @var array Счётчик событий текущей сессии */
     private array $stats = [
-        'total'      => 0,
-        'created'    => 0,
+        'total'        => 0,
+        'created'      => 0,
         'deduplicated' => 0,
     ];
+
+    /** @var SalesChannel[]|null Кэш активных каналов (на время запроса) */
+    private ?array $activeChannelsCache = null;
 
     // ═══════════════════════════════════════════
     // HIGH-LEVEL API (вызывается из Persister/GoldenRecord)
@@ -41,7 +51,7 @@ class OutboxService extends Component
      */
     public function modelCreated(int $modelId, ?string $sessionId = null, array $payload = []): void
     {
-        $this->emit('model', $modelId, $modelId, 'created', $payload, 'catalog_persister', $sessionId);
+        $this->fanOut('model', $modelId, $modelId, 'created', $payload, 'catalog_persister', $sessionId);
     }
 
     /**
@@ -49,7 +59,7 @@ class OutboxService extends Component
      */
     public function modelUpdated(int $modelId, ?string $sessionId = null, array $payload = []): void
     {
-        $this->emit('model', $modelId, $modelId, 'updated', $payload, 'golden_record', $sessionId);
+        $this->fanOut('model', $modelId, $modelId, 'updated', $payload, 'golden_record', $sessionId);
     }
 
     /**
@@ -57,7 +67,7 @@ class OutboxService extends Component
      */
     public function variantCreated(int $modelId, int $variantId, ?string $sessionId = null, array $payload = []): void
     {
-        $this->emit('variant', $variantId, $modelId, 'created', $payload, 'catalog_persister', $sessionId);
+        $this->fanOut('variant', $variantId, $modelId, 'created', $payload, 'catalog_persister', $sessionId);
     }
 
     /**
@@ -65,7 +75,7 @@ class OutboxService extends Component
      */
     public function variantUpdated(int $modelId, int $variantId, ?string $sessionId = null, array $payload = []): void
     {
-        $this->emit('variant', $variantId, $modelId, 'updated', $payload, 'golden_record', $sessionId);
+        $this->fanOut('variant', $variantId, $modelId, 'updated', $payload, 'golden_record', $sessionId);
     }
 
     /**
@@ -73,7 +83,7 @@ class OutboxService extends Component
      */
     public function offerCreated(int $modelId, int $variantId, int $offerId, ?string $sessionId = null, array $payload = []): void
     {
-        $this->emit('offer', $offerId, $modelId, 'created', $payload, 'catalog_persister', $sessionId);
+        $this->fanOut('offer', $offerId, $modelId, 'created', $payload, 'catalog_persister', $sessionId);
     }
 
     /**
@@ -81,7 +91,7 @@ class OutboxService extends Component
      */
     public function offerUpdated(int $modelId, int $variantId, int $offerId, ?string $sessionId = null, array $payload = []): void
     {
-        $this->emit('offer', $offerId, $modelId, 'updated', $payload, 'catalog_persister', $sessionId);
+        $this->fanOut('offer', $offerId, $modelId, 'updated', $payload, 'catalog_persister', $sessionId);
     }
 
     /**
@@ -89,7 +99,7 @@ class OutboxService extends Component
      */
     public function priceChanged(int $modelId, int $variantId, int $offerId, array $priceDelta = [], ?string $sessionId = null): void
     {
-        $this->emit('offer', $offerId, $modelId, 'price_changed', $priceDelta, 'catalog_persister', $sessionId);
+        $this->fanOut('offer', $offerId, $modelId, 'price_changed', $priceDelta, 'catalog_persister', $sessionId);
     }
 
     /**
@@ -97,7 +107,35 @@ class OutboxService extends Component
      */
     public function stockChanged(int $modelId, int $variantId, int $offerId, array $stockDelta = [], ?string $sessionId = null): void
     {
-        $this->emit('offer', $offerId, $modelId, 'stock_changed', $stockDelta, 'catalog_persister', $sessionId);
+        $this->fanOut('offer', $offerId, $modelId, 'stock_changed', $stockDelta, 'catalog_persister', $sessionId);
+    }
+
+    // ═══════════════════════════════════════════
+    // FAN-OUT: одно событие → N записей (по каналу)
+    // ═══════════════════════════════════════════
+
+    /**
+     * Fan-out: создать outbox-запись для КАЖДОГО активного канала.
+     */
+    protected function fanOut(
+        string  $entityType,
+        int     $entityId,
+        int     $modelId,
+        string  $eventType,
+        array   $payload = [],
+        string  $source = 'catalog_persister',
+        ?string $sessionId = null
+    ): void {
+        $channels = $this->getActiveChannels();
+
+        if (empty($channels)) {
+            Yii::warning('OutboxService: no active sales channels, event skipped', 'marketplace.outbox');
+            return;
+        }
+
+        foreach ($channels as $channel) {
+            $this->emit($entityType, $entityId, $modelId, $eventType, $payload, $source, $sessionId, $channel->id);
+        }
     }
 
     // ═══════════════════════════════════════════
@@ -105,32 +143,34 @@ class OutboxService extends Component
     // ═══════════════════════════════════════════
 
     /**
-     * Записать событие в Outbox.
+     * Записать событие в Outbox для конкретного канала.
      *
      * ВАЖНО: Этот метод должен вызываться ВНУТРИ активной транзакции!
      */
     protected function emit(
-        string $entityType,
-        int    $entityId,
-        int    $modelId,
-        string $eventType,
-        array  $payload = [],
-        string $source = 'catalog_persister',
-        ?string $sessionId = null
+        string  $entityType,
+        int     $entityId,
+        int     $modelId,
+        string  $eventType,
+        array   $payload = [],
+        string  $source = 'catalog_persister',
+        ?string $sessionId = null,
+        int     $channelId = 0
     ): void {
         $this->stats['total']++;
 
         $db = Yii::$app->db;
 
-        // Дедупликация: не создаём дубли для pending-записей той же сущности
+        // Дедупликация: не создаём дубли для pending-записей той же сущности НА ТОМ ЖЕ КАНАЛЕ
         if ($this->deduplication) {
             $exists = $db->createCommand("
                 SELECT 1 FROM {{%marketplace_outbox}}
-                WHERE entity_type = :type AND entity_id = :eid AND status = 'pending'
+                WHERE entity_type = :type AND entity_id = :eid AND status = 'pending' AND channel_id = :cid
                 LIMIT 1
             ", [
                 ':type' => $entityType,
                 ':eid'  => $entityId,
+                ':cid'  => $channelId,
             ])->queryScalar();
 
             if ($exists) {
@@ -140,12 +180,13 @@ class OutboxService extends Component
                     SET payload = payload || :payload::jsonb,
                         event_type = :event,
                         created_at = NOW()
-                    WHERE entity_type = :type AND entity_id = :eid AND status = 'pending'
+                    WHERE entity_type = :type AND entity_id = :eid AND status = 'pending' AND channel_id = :cid
                 ", [
                     ':payload' => json_encode($payload, JSON_UNESCAPED_UNICODE),
                     ':event'   => $eventType,
                     ':type'    => $entityType,
                     ':eid'     => $entityId,
+                    ':cid'     => $channelId,
                 ])->execute();
 
                 $this->stats['deduplicated']++;
@@ -157,6 +198,7 @@ class OutboxService extends Component
             'entity_type'       => $entityType,
             'entity_id'         => $entityId,
             'model_id'          => $modelId,
+            'channel_id'        => $channelId,
             'event_type'        => $eventType,
             'payload'           => new JsonExpression($payload ?: new \stdClass()),
             'status'            => 'pending',
@@ -172,11 +214,11 @@ class OutboxService extends Component
     // ═══════════════════════════════════════════
 
     /**
-     * Забрать батч pending-событий, сгруппированных по model_id.
+     * Забрать батч pending-событий, сгруппированных по model_id И channel_id.
      *
      * Использует SELECT ... FOR UPDATE SKIP LOCKED для безопасной конкурентной обработки.
      *
-     * @return array<int, array> model_id => [outbox_rows]
+     * @return array<string, array> "model_id:channel_id" => [outbox_rows]
      */
     public function fetchPendingBatch(int $limit = 100): array
     {
@@ -193,14 +235,14 @@ class OutboxService extends Component
                 LIMIT :limit
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id, entity_type, entity_id, model_id, event_type, payload, import_session_id
+            RETURNING id, entity_type, entity_id, model_id, channel_id, event_type, payload, import_session_id
         ", [':limit' => $limit])->queryAll();
 
-        // Группируем по model_id
+        // Группируем по "model_id:channel_id" — уникальный ключ для обработки
         $grouped = [];
         foreach ($rows as $row) {
-            $modelId = (int)$row['model_id'];
-            $grouped[$modelId][] = $row;
+            $key = (int)$row['model_id'] . ':' . (int)$row['channel_id'];
+            $grouped[$key][] = $row;
         }
 
         return $grouped;
@@ -291,6 +333,27 @@ class OutboxService extends Component
     }
 
     /**
+     * Статистика по каналам.
+     */
+    public function getQueueStatsByChannel(): array
+    {
+        $rows = Yii::$app->db->createCommand("
+            SELECT sc.name as channel_name, mo.status, count(*) as cnt
+            FROM {{%marketplace_outbox}} mo
+            JOIN {{%sales_channels}} sc ON sc.id = mo.channel_id
+            GROUP BY sc.name, mo.status
+            ORDER BY sc.name, mo.status
+        ")->queryAll();
+
+        $stats = [];
+        foreach ($rows as $row) {
+            $stats[$row['channel_name']][$row['status']] = (int)$row['cnt'];
+        }
+
+        return $stats;
+    }
+
+    /**
      * Получить статистику текущей сессии.
      */
     public function getStats(): array
@@ -304,5 +367,30 @@ class OutboxService extends Component
     public function resetStats(): void
     {
         $this->stats = ['total' => 0, 'created' => 0, 'deduplicated' => 0];
+    }
+
+    /**
+     * Сбросить кэш активных каналов (для тестов / длинных процессов).
+     */
+    public function resetChannelCache(): void
+    {
+        $this->activeChannelsCache = null;
+    }
+
+    // ═══════════════════════════════════════════
+    // PRIVATE
+    // ═══════════════════════════════════════════
+
+    /**
+     * Получить список активных каналов (кэшируется на время запроса).
+     *
+     * @return SalesChannel[]
+     */
+    private function getActiveChannels(): array
+    {
+        if ($this->activeChannelsCache === null) {
+            $this->activeChannelsCache = SalesChannel::findActive();
+        }
+        return $this->activeChannelsCache;
     }
 }

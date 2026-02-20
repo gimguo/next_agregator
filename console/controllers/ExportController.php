@@ -2,8 +2,10 @@
 
 namespace console\controllers;
 
+use common\models\SalesChannel;
 use common\services\OutboxService;
 use common\services\RosMatrasSyndicationService;
+use common\services\channel\ChannelDriverFactory;
 use common\services\marketplace\MarketplaceApiClientInterface;
 use common\services\marketplace\MarketplaceUnavailableException;
 use yii\console\Controller;
@@ -12,29 +14,30 @@ use yii\helpers\Console;
 use Yii;
 
 /**
- * Экспорт данных на витрину RosMatras (Syndication Worker).
+ * Multi-Channel Export Worker — синдикация MDM-каталога на витрины.
  *
  * Обрабатывает очередь marketplace_outbox:
  *   1. Забирает pending-события (SELECT FOR UPDATE SKIP LOCKED)
- *   2. Группирует по model_id
- *   3. Строит проекцию через RosMatrasSyndicationService
- *   4. Отправляет через RosMatrasApiClient
- *   5. Помечает success / error
+ *   2. Группирует по model_id + channel_id
+ *   3. Через ChannelDriverFactory получает Синдикатор и ApiClient
+ *   4. Строит проекцию, специфичную для канала
+ *   5. Отправляет через API конкретного канала
+ *   6. Помечает success / error
  *
- * Устойчивость к сбоям:
- *   - MarketplaceUnavailableException → rollback записей в pending, экспоненциальная задержка
- *   - Обычные ошибки данных → error (не ретраить автоматически)
- *   - Daemon режим с graceful shutdown при недоступности API
+ * Каналы: RosMatras, Ozon, WB, Yandex и т.д.
+ * Токены берутся из SalesChannel->api_config (не из глобальных params).
  *
  * Команды:
  *   php yii export/process-outbox          # Одна итерация
  *   php yii export/daemon                  # Бесконечный цикл
- *   php yii export/push-all                # Полная синхронизация (Initial Seed)
+ *   php yii export/push-all                # Полная синхронизация всех каналов
+ *   php yii export/push-channel --channel=1  # Полная синхронизация одного канала
  *   php yii export/sync-model --model=123  # Принудительная синхронизация модели
- *   php yii export/ping                    # Health-check API RosMatras
+ *   php yii export/ping                    # Health-check всех каналов
  *   php yii export/status                  # Статистика очереди
  *   php yii export/retry-errors            # Retry с exponential backoff
  *   php yii export/preview --model=123     # Предпросмотр проекции
+ *   php yii export/channels                # Список каналов
  */
 class ExportController extends Controller
 {
@@ -43,6 +46,9 @@ class ExportController extends Controller
 
     /** @var int ID модели (для preview/sync-model) */
     public int $model = 0;
+
+    /** @var int ID канала (для push-channel) */
+    public int $channel = 0;
 
     /** @var int Интервал daemon (секунды) */
     public int $interval = 10;
@@ -53,24 +59,28 @@ class ExportController extends Controller
     /** @var OutboxService */
     private OutboxService $outbox;
 
-    /** @var RosMatrasSyndicationService */
+    /** @var ChannelDriverFactory */
+    private ChannelDriverFactory $factory;
+
+    /** @var RosMatrasSyndicationService Legacy-сервис для preview/sync-model */
     private RosMatrasSyndicationService $syndicator;
 
-    /** @var MarketplaceApiClientInterface */
-    private MarketplaceApiClientInterface $client;
+    /** @var MarketplaceApiClientInterface Legacy-клиент для sync-model */
+    private MarketplaceApiClientInterface $legacyClient;
 
     public function init(): void
     {
         parent::init();
         $this->outbox = Yii::$app->get('outbox');
+        $this->factory = Yii::$app->get('channelFactory');
         $this->syndicator = Yii::$app->get('syndicationService');
-        $this->client = Yii::$app->get('marketplaceClient');
+        $this->legacyClient = Yii::$app->get('marketplaceClient');
     }
 
     public function options($actionID): array
     {
         return array_merge(parent::options($actionID), [
-            'batch', 'model', 'interval', 'maxRetries',
+            'batch', 'model', 'channel', 'interval', 'maxRetries',
         ]);
     }
 
@@ -79,6 +89,7 @@ class ExportController extends Controller
         return array_merge(parent::optionAliases(), [
             'b' => 'batch',
             'm' => 'model',
+            'c' => 'channel',
         ]);
     }
 
@@ -87,20 +98,20 @@ class ExportController extends Controller
     // ═══════════════════════════════════════════
 
     /**
-     * Обработать очередь outbox (одна итерация).
+     * Обработать очередь outbox (одна итерация) — Multi-Channel.
      *
-     * При MarketplaceUnavailableException — записи возвращаются в pending,
-     * команда завершается с ненулевым exit-кодом.
+     * Теперь группирует по model_id + channel_id и через фабрику
+     * получает правильный Синдикатор + ApiClient для каждого канала.
      */
     public function actionProcessOutbox(): int
     {
         $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
-        $this->stdout("║   EXPORT: Обработка Outbox               ║\n", Console::FG_CYAN);
+        $this->stdout("║   EXPORT: Обработка Outbox (Multi-Ch.)   ║\n", Console::FG_CYAN);
         $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
 
         $startTime = microtime(true);
 
-        // 1. Забираем pending-события, сгруппированные по model_id
+        // 1. Забираем pending-события, сгруппированные по model_id:channel_id
         $grouped = $this->outbox->fetchPendingBatch($this->batch);
 
         if (empty($grouped)) {
@@ -108,85 +119,97 @@ class ExportController extends Controller
             return ExitCode::OK;
         }
 
-        $modelCount = count($grouped);
+        $groupCount = count($grouped);
         $eventCount = array_sum(array_map('count', $grouped));
 
-        $this->stdout("  → Забрали {$eventCount} событий для {$modelCount} моделей\n\n", Console::FG_YELLOW);
+        $this->stdout("  → Забрали {$eventCount} событий для {$groupCount} задач (model:channel)\n\n", Console::FG_YELLOW);
 
-        $successModels = 0;
-        $errorModels = 0;
-        $skippedModels = 0;
+        $successCount = 0;
+        $errorCount = 0;
+        $skippedCount = 0;
 
-        // 2. Для каждой уникальной модели — строим проекцию и отправляем
-        foreach ($grouped as $modelId => $events) {
+        // Кэш SalesChannel по ID
+        $channelCache = [];
+
+        // 2. Для каждого model_id:channel_id — строим проекцию и отправляем
+        foreach ($grouped as $groupKey => $events) {
+            [$modelId, $channelId] = array_map('intval', explode(':', $groupKey));
             $outboxIds = array_column($events, 'id');
             $eventTypes = array_unique(array_column($events, 'event_type'));
 
-            $this->stdout("  [model_id={$modelId}] ", Console::FG_CYAN);
+            // Получаем канал
+            if (!isset($channelCache[$channelId])) {
+                $channelCache[$channelId] = SalesChannel::findOne($channelId);
+            }
+            $channel = $channelCache[$channelId];
+
+            if (!$channel || !$channel->is_active) {
+                $this->outbox->markSuccess($outboxIds); // Канал удалён/выключен — пропускаем
+                $skippedCount++;
+                $this->stdout("  [model={$modelId} ch={$channelId}] ", Console::FG_GREY);
+                $this->stdout("→ SKIP (канал не найден или неактивен)\n", Console::FG_YELLOW);
+                continue;
+            }
+
+            $this->stdout("  [model={$modelId} → {$channel->name}] ", Console::FG_CYAN);
             $this->stdout(count($events) . " событий (" . implode(', ', $eventTypes) . ") ");
 
             try {
+                // Через фабрику получаем синдикатор и клиент
+                $syndicator = $this->factory->getSyndicator($channel);
+                $apiClient = $this->factory->getApiClient($channel);
+
                 // Строим проекцию
-                $projection = $this->syndicator->buildProductProjection($modelId);
+                $projection = $syndicator->buildProjection($modelId, $channel);
 
                 if (!$projection) {
                     $this->outbox->markSuccess($outboxIds);
-                    $skippedModels++;
+                    $skippedCount++;
                     $this->stdout("→ SKIP (модель не найдена)\n", Console::FG_YELLOW);
                     continue;
                 }
 
-                // Добавляем контекст событий
-                $projection['_outbox_events'] = array_map(fn($e) => [
-                    'event_type'  => $e['event_type'],
-                    'entity_type' => $e['entity_type'],
-                ], $events);
-
-                // Отправляем на витрину
-                $result = $this->client->pushProduct($modelId, $projection);
+                // Отправляем на канал
+                $result = $apiClient->push($modelId, $projection, $channel);
 
                 if ($result) {
                     $this->outbox->markSuccess($outboxIds);
-                    $successModels++;
+                    $successCount++;
+                    $name = $projection['name'] ?? '?';
+                    $variants = $projection['variant_count'] ?? count($projection['variants'] ?? []);
+                    $price = $projection['best_price'] ?? null;
+                    $priceStr = $price ? number_format($price, 0, '.', ' ') . '₽' : 'N/A';
                     $this->stdout("→ OK", Console::FG_GREEN);
-                    $this->stdout(" ({$projection['name']}, " .
-                        "{$projection['variant_count']} вар., " .
-                        ($projection['best_price'] ? number_format($projection['best_price'], 0, '.', ' ') . '₽' : 'N/A') .
-                        ")\n");
+                    $this->stdout(" ({$name}, {$variants} вар., {$priceStr})\n");
                 } else {
-                    $this->outbox->markError($outboxIds, 'pushProduct returned false');
-                    $errorModels++;
+                    $this->outbox->markError($outboxIds, 'push returned false');
+                    $errorCount++;
                     $this->stdout("→ ERROR (returned false)\n", Console::FG_RED);
                 }
 
             } catch (MarketplaceUnavailableException $e) {
-                // ═══ КРИТИЧНО: API недоступен ═══
-                // Возвращаем ВСЕ оставшиеся записи (включая текущие) обратно в pending
+                // API канала недоступен — rollback
                 $this->rollbackToPending($outboxIds);
-
-                // Возвращаем оставшиеся необработанные модели
-                $this->rollbackRemainingModels($grouped, $modelId);
+                $this->rollbackRemainingGroups($grouped, $groupKey);
 
                 $this->stdout("→ API UNAVAILABLE\n", Console::FG_RED);
-                $this->stdout("\n  ⚠ API RosMatras недоступен: {$e->getMessage()}\n", Console::FG_RED);
-                $this->stdout("  → Все незавершённые записи возвращены в pending.\n", Console::FG_YELLOW);
-                $this->stdout("  → Worker завершает работу. Следующая попытка через cron.\n\n", Console::FG_YELLOW);
+                $this->stdout("\n  ⚠ API канала '{$channel->name}' недоступен: {$e->getMessage()}\n", Console::FG_RED);
+                $this->stdout("  → Записи возвращены в pending.\n\n", Console::FG_YELLOW);
 
                 Yii::error(
-                    "Export worker: API unavailable, rolling back. Error: {$e->getMessage()}",
+                    "Export worker: channel '{$channel->name}' unavailable: {$e->getMessage()}",
                     'marketplace.export'
                 );
 
                 return ExitCode::TEMPFAIL;
 
             } catch (\Throwable $e) {
-                // Ошибка данных — помечаем error и продолжаем с остальными
                 $this->outbox->markError($outboxIds, mb_substr($e->getMessage(), 0, 500));
-                $errorModels++;
+                $errorCount++;
                 $this->stdout("→ ERROR: {$e->getMessage()}\n", Console::FG_RED);
 
                 Yii::error(
-                    "Export error model_id={$modelId}: {$e->getMessage()}",
+                    "Export error model={$modelId} channel={$channel->name}: {$e->getMessage()}",
                     'marketplace.export'
                 );
             }
@@ -198,47 +221,43 @@ class ExportController extends Controller
         $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
         $this->stdout("║   РЕЗУЛЬТАТ ЭКСПОРТА                     ║\n", Console::FG_CYAN);
         $this->stdout("╠══════════════════════════════════════════╣\n", Console::FG_CYAN);
-        $this->stdout("║ Моделей:    " . str_pad($modelCount, 28) . "║\n");
-        $this->stdout("║ Успешно:    " . str_pad($successModels, 28) . "║\n", Console::FG_GREEN);
-        $this->stdout("║ Пропущено:  " . str_pad($skippedModels, 28) . "║\n");
-        $this->stdout("║ Ошибки:     " . str_pad($errorModels, 28) . "║\n",
-            $errorModels > 0 ? Console::FG_RED : Console::FG_GREEN);
+        $this->stdout("║ Задач:      " . str_pad($groupCount, 28) . "║\n");
+        $this->stdout("║ Успешно:    " . str_pad($successCount, 28) . "║\n", Console::FG_GREEN);
+        $this->stdout("║ Пропущено:  " . str_pad($skippedCount, 28) . "║\n");
+        $this->stdout("║ Ошибки:     " . str_pad($errorCount, 28) . "║\n",
+            $errorCount > 0 ? Console::FG_RED : Console::FG_GREEN);
         $this->stdout("║ Время:      " . str_pad($duration . 's', 28) . "║\n");
         $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
 
-        return $errorModels > 0 ? ExitCode::UNSPECIFIED_ERROR : ExitCode::OK;
+        return $errorCount > 0 ? ExitCode::UNSPECIFIED_ERROR : ExitCode::OK;
     }
 
     /**
-     * Daemon-режим: бесконечный цикл обработки outbox.
-     *
-     * При MarketplaceUnavailableException:
-     *   - Все записи возвращаются в pending
-     *   - Экспоненциальная задержка перед следующей попыткой
-     *   - Daemon продолжает работать (не умирает)
+     * Daemon-режим: бесконечный цикл обработки outbox (Multi-Channel).
      */
     public function actionDaemon(): int
     {
-        $this->stdout("\n  EXPORT DAEMON STARTED (interval={$this->interval}s, batch={$this->batch})\n", Console::FG_GREEN);
+        $this->stdout("\n  EXPORT DAEMON STARTED (interval={$this->interval}s, batch={$this->batch}) [Multi-Channel]\n", Console::FG_GREEN);
         $this->stdout("  Press Ctrl+C to stop.\n\n");
 
         $iteration = 0;
         $consecutiveApiFailures = 0;
 
+        // Кэш каналов
+        $channelCache = [];
+
         while (true) {
             $iteration++;
             $startTime = microtime(true);
 
-            // Забираем батч
             $grouped = $this->outbox->fetchPendingBatch($this->batch);
 
             if (!empty($grouped)) {
                 $eventCount = array_sum(array_map('count', $grouped));
-                $modelCount = count($grouped);
+                $groupCount = count($grouped);
 
                 $this->stdout(
-                    "  [" . date('H:i:s') . "] #{$iteration}: " .
-                    "{$eventCount} events, {$modelCount} models",
+                    "  [" . date('H:i:s') . "] #{$iteration}: {$eventCount} events, {$groupCount} groups",
                     Console::FG_YELLOW
                 );
 
@@ -246,36 +265,49 @@ class ExportController extends Controller
                 $errors = 0;
                 $apiDown = false;
 
-                foreach ($grouped as $modelId => $events) {
+                foreach ($grouped as $groupKey => $events) {
+                    [$modelId, $channelId] = array_map('intval', explode(':', $groupKey));
                     $outboxIds = array_column($events, 'id');
 
+                    if (!isset($channelCache[$channelId])) {
+                        $channelCache[$channelId] = SalesChannel::findOne($channelId);
+                    }
+                    $channel = $channelCache[$channelId];
+
+                    if (!$channel || !$channel->is_active) {
+                        $this->outbox->markSuccess($outboxIds);
+                        continue;
+                    }
+
                     try {
-                        $projection = $this->syndicator->buildProductProjection($modelId);
+                        $syndicator = $this->factory->getSyndicator($channel);
+                        $apiClient = $this->factory->getApiClient($channel);
+
+                        $projection = $syndicator->buildProjection($modelId, $channel);
 
                         if (!$projection) {
                             $this->outbox->markSuccess($outboxIds);
                             continue;
                         }
 
-                        $result = $this->client->pushProduct($modelId, $projection);
+                        $result = $apiClient->push($modelId, $projection, $channel);
 
                         if ($result) {
                             $this->outbox->markSuccess($outboxIds);
                             $success++;
                         } else {
-                            $this->outbox->markError($outboxIds, 'pushProduct returned false');
+                            $this->outbox->markError($outboxIds, 'push returned false');
                             $errors++;
                         }
 
                     } catch (MarketplaceUnavailableException $e) {
-                        // API упал — rollback всех оставшихся и backoff
                         $this->rollbackToPending($outboxIds);
-                        $this->rollbackRemainingModels($grouped, $modelId);
+                        $this->rollbackRemainingGroups($grouped, $groupKey);
                         $apiDown = true;
                         $consecutiveApiFailures++;
 
                         Yii::error(
-                            "Daemon: API unavailable (failure #{$consecutiveApiFailures}): {$e->getMessage()}",
+                            "Daemon: channel '{$channel->name}' unavailable (fail #{$consecutiveApiFailures}): {$e->getMessage()}",
                             'marketplace.export'
                         );
                         break;
@@ -289,21 +321,17 @@ class ExportController extends Controller
                 $duration = round(microtime(true) - $startTime, 2);
 
                 if ($apiDown) {
-                    // Экспоненциальная задержка
                     $backoffDelay = MarketplaceUnavailableException::calculateBackoff(
                         $consecutiveApiFailures, 10, 600
                     );
-
                     $this->stdout(
                         " → API DOWN (fail #{$consecutiveApiFailures}), backoff {$backoffDelay}s\n",
                         Console::FG_RED
                     );
-
                     sleep($backoffDelay);
                     continue;
                 }
 
-                // API работает — сбрасываем счётчик неудач
                 $consecutiveApiFailures = 0;
 
                 $this->stdout(
@@ -311,17 +339,21 @@ class ExportController extends Controller
                     $errors > 0 ? Console::FG_YELLOW : Console::FG_GREEN
                 );
             } else {
-                // Тишина
                 if ($iteration % 6 === 0) {
                     $this->stdout(
                         "  [" . date('H:i:s') . "] Idle, queue empty.\n",
                         Console::FG_GREY
                     );
                 }
-                // Если были failures — постепенно сбрасываем
                 if ($consecutiveApiFailures > 0) {
                     $consecutiveApiFailures = max(0, $consecutiveApiFailures - 1);
                 }
+            }
+
+            // Периодически сбрасываем кэш каналов (чтобы подхватить изменения)
+            if ($iteration % 30 === 0) {
+                $channelCache = [];
+                $this->outbox->resetChannelCache();
             }
 
             sleep($this->interval);
@@ -329,49 +361,42 @@ class ExportController extends Controller
     }
 
     // ═══════════════════════════════════════════
-    // FULL SYNC / INITIAL SEED
+    // FULL SYNC / INITIAL SEED (Multi-Channel)
     // ═══════════════════════════════════════════
 
     /**
-     * Полная синхронизация ВСЕХ активных моделей на витрину (Initial Seed / Mass Push).
+     * Полная синхронизация ВСЕХ активных моделей на ВСЕ активные каналы.
      *
-     * Логика:
-     *   1. Забирает все active product_models из БД батчами по 100 (экономия памяти)
-     *   2. Для каждого батча строит проекции через RosMatrasSyndicationService
-     *   3. Группирует по 50 и отправляет через RosMatrasApiClient::pushBatch()
-     *   4. Выводит красивый прогресс-бар
-     *
-     * Использование:
-     *   php yii export/push-all                   # Все активные модели
-     *   php yii export/push-all --batch=50        # Размер батча DB-запроса
-     *
-     * Сценарии:
-     *   - Initial Seed: пустая витрина → заливаем весь эталонный каталог
-     *   - Re-sync: после обновления схемы проекции
-     *   - Recovery: после потери данных на витрине
+     * Для каждого канала:
+     *   1. Получает Синдикатор + ApiClient через фабрику
+     *   2. Итерирует все active модели батчами
+     *   3. Строит канало-специфичную проекцию
+     *   4. Отправляет через pushBatch
      */
     public function actionPushAll(): int
     {
         $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
-        $this->stdout("║   FULL SYNC: Все модели → РосМатрас      ║\n", Console::FG_CYAN);
+        $this->stdout("║   FULL SYNC: Все модели → Все каналы     ║\n", Console::FG_CYAN);
         $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
 
-        // 1. Проверяем доступность API
-        $this->stdout("  1. Health check API... ", Console::FG_CYAN);
-        try {
-            $healthy = $this->client->healthCheck();
-            if (!$healthy) {
-                $this->stderr("FAIL — API не прошёл health check.\n\n", Console::FG_RED);
-                return ExitCode::UNAVAILABLE;
-            }
-            $this->stdout("OK ✓\n\n", Console::FG_GREEN);
-        } catch (\Throwable $e) {
-            $this->stderr("FAIL ✗ ({$e->getMessage()})\n", Console::FG_RED);
-            $this->stderr("  API недоступен. Сначала убедитесь, что витрина запущена.\n\n", Console::FG_RED);
-            return ExitCode::UNAVAILABLE;
+        $channels = SalesChannel::findActive();
+
+        if (empty($channels)) {
+            $this->stderr("  ✗ Нет активных каналов продаж.\n\n", Console::FG_RED);
+            return ExitCode::CONFIG;
         }
 
-        // 2. Считаем общее кол-во моделей
+        $this->stdout("  Активные каналы: " . count($channels) . "\n", Console::FG_CYAN);
+        foreach ($channels as $ch) {
+            $hasDriver = $this->factory->hasDriver($ch->driver);
+            $this->stdout("    • {$ch->name} (driver={$ch->driver}) " .
+                ($hasDriver ? "✓" : "✗ (драйвер не зарегистрирован)") . "\n",
+                $hasDriver ? Console::FG_GREEN : Console::FG_RED
+            );
+        }
+        $this->stdout("\n");
+
+        // Считаем модели
         $db = Yii::$app->db;
         $totalModels = (int)$db->createCommand(
             "SELECT COUNT(*) FROM {{%product_models}} WHERE status = 'active'"
@@ -382,11 +407,93 @@ class ExportController extends Controller
             return ExitCode::OK;
         }
 
-        $this->stdout("  2. Найдено моделей: {$totalModels}\n\n", Console::FG_YELLOW);
+        $this->stdout("  Найдено моделей: {$totalModels}\n\n", Console::FG_YELLOW);
 
-        // 3. Настройки
-        $dbBatchSize = $this->batch;    // Размер батча для DB-запроса (по умолчанию 100)
-        $pushBatchSize = 50;            // Размер батча для API pushBatch
+        // Синхронизируем каждый канал по очереди
+        $allOk = true;
+        foreach ($channels as $ch) {
+            if (!$this->factory->hasDriver($ch->driver)) {
+                $this->stdout("  ⤳ Пропуск канала '{$ch->name}': драйвер '{$ch->driver}' не зарегистрирован.\n\n", Console::FG_YELLOW);
+                continue;
+            }
+
+            $result = $this->pushAllForChannel($ch, $totalModels);
+            if ($result !== ExitCode::OK) {
+                $allOk = false;
+            }
+        }
+
+        return $allOk ? ExitCode::OK : ExitCode::UNSPECIFIED_ERROR;
+    }
+
+    /**
+     * Полная синхронизация ВСЕХ активных моделей на ОДИН канал.
+     *
+     * Использование:
+     *   php yii export/push-channel --channel=1
+     */
+    public function actionPushChannel(): int
+    {
+        if (!$this->channel) {
+            $this->stderr("  ✗ Укажите --channel=ID\n\n", Console::FG_RED);
+            return ExitCode::USAGE;
+        }
+
+        $channel = SalesChannel::findOne($this->channel);
+        if (!$channel) {
+            $this->stderr("  ✗ Канал #{$this->channel} не найден.\n\n", Console::FG_RED);
+            return ExitCode::DATAERR;
+        }
+
+        if (!$this->factory->hasDriver($channel->driver)) {
+            $this->stderr("  ✗ Драйвер '{$channel->driver}' не зарегистрирован.\n\n", Console::FG_RED);
+            return ExitCode::CONFIG;
+        }
+
+        $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
+        $this->stdout("║   FULL SYNC: Все модели → {$channel->name}" . str_repeat(' ', max(0, 14 - mb_strlen($channel->name))) . "║\n", Console::FG_CYAN);
+        $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
+
+        $db = Yii::$app->db;
+        $totalModels = (int)$db->createCommand(
+            "SELECT COUNT(*) FROM {{%product_models}} WHERE status = 'active'"
+        )->queryScalar();
+
+        if ($totalModels === 0) {
+            $this->stdout("  ✓ Нет активных моделей для синхронизации.\n\n", Console::FG_YELLOW);
+            return ExitCode::OK;
+        }
+
+        return $this->pushAllForChannel($channel, $totalModels);
+    }
+
+    /**
+     * Внутренний метод: полная синхронизация всех моделей для одного канала.
+     */
+    private function pushAllForChannel(SalesChannel $channel, int $totalModels): int
+    {
+        $this->stdout("  ═══ Канал: {$channel->name} (driver={$channel->driver}) ═══\n\n", Console::FG_CYAN);
+
+        // Health check
+        $this->stdout("  1. Health check... ", Console::FG_CYAN);
+        try {
+            $apiClient = $this->factory->getApiClient($channel);
+            $healthy = $apiClient->healthCheck($channel);
+            if (!$healthy) {
+                $this->stderr("FAIL — API не прошёл health check.\n\n", Console::FG_RED);
+                return ExitCode::UNAVAILABLE;
+            }
+            $this->stdout("OK ✓\n", Console::FG_GREEN);
+        } catch (\Throwable $e) {
+            $this->stderr("FAIL ✗ ({$e->getMessage()})\n\n", Console::FG_RED);
+            return ExitCode::UNAVAILABLE;
+        }
+
+        $this->stdout("  2. Моделей: {$totalModels}\n\n", Console::FG_YELLOW);
+
+        $syndicator = $this->factory->getSyndicator($channel);
+        $dbBatchSize = $this->batch;
+        $pushBatchSize = 50;
 
         $startTime = microtime(true);
         $processed = 0;
@@ -395,10 +502,9 @@ class ExportController extends Controller
         $skippedCount = 0;
         $apiFailures = 0;
 
-        // 4. Начинаем прогресс-бар
-        Console::startProgress(0, $totalModels, '  Синхронизация: ', 60);
+        Console::startProgress(0, $totalModels, "  [{$channel->name}] Синхронизация: ", 60);
 
-        // 5. Основной цикл — батчи из БД
+        $db = Yii::$app->db;
         $offset = 0;
 
         while (true) {
@@ -410,16 +516,15 @@ class ExportController extends Controller
             ", [':limit' => $dbBatchSize, ':offset' => $offset])->queryColumn();
 
             if (empty($modelRows)) {
-                break; // Все модели обработаны
+                break;
             }
 
             $offset += count($modelRows);
-
-            // Строим проекции для текущего DB-батча
             $projections = [];
+
             foreach ($modelRows as $modelId) {
                 try {
-                    $projection = $this->syndicator->buildProductProjection((int)$modelId);
+                    $projection = $syndicator->buildProjection((int)$modelId, $channel);
 
                     if ($projection) {
                         $projections[(int)$modelId] = $projection;
@@ -429,7 +534,7 @@ class ExportController extends Controller
                 } catch (\Throwable $e) {
                     $errorCount++;
                     Yii::error(
-                        "PushAll: projection error model_id={$modelId}: {$e->getMessage()}",
+                        "PushAll [{$channel->name}]: projection error model_id={$modelId}: {$e->getMessage()}",
                         'marketplace.export'
                     );
                 }
@@ -437,62 +542,60 @@ class ExportController extends Controller
                 $processed++;
                 Console::updateProgress($processed, $totalModels);
 
-                // Отправляем, когда накопили pushBatchSize проекций
                 if (count($projections) >= $pushBatchSize) {
-                    $pushResult = $this->pushBatchSafe($projections, $apiFailures);
+                    $pushResult = $this->pushBatchSafeChannel($projections, $apiFailures, $channel, $apiClient);
                     $successCount += $pushResult['success'];
                     $errorCount += $pushResult['errors'];
                     $apiFailures = $pushResult['apiFailures'];
                     $projections = [];
 
-                    // Если API упал 3 раза подряд — прерываем
                     if ($apiFailures >= 3) {
                         Console::endProgress("ABORTED\n");
-                        $this->stderr("\n  ⚠ API недоступен (3 последовательных ошибки). Прерываем.\n", Console::FG_RED);
-                        $this->printPushAllReport($totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
+                        $this->stderr("\n  ⚠ API '{$channel->name}' недоступен (3 подряд). Прерываем.\n", Console::FG_RED);
+                        $this->printPushAllReport($channel->name, $totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
                         return ExitCode::TEMPFAIL;
                     }
                 }
             }
 
-            // Отправляем остаток проекций после DB-батча
             if (!empty($projections)) {
-                $pushResult = $this->pushBatchSafe($projections, $apiFailures);
+                $pushResult = $this->pushBatchSafeChannel($projections, $apiFailures, $channel, $apiClient);
                 $successCount += $pushResult['success'];
                 $errorCount += $pushResult['errors'];
                 $apiFailures = $pushResult['apiFailures'];
 
                 if ($apiFailures >= 3) {
                     Console::endProgress("ABORTED\n");
-                    $this->stderr("\n  ⚠ API недоступен (3 последовательных ошибки). Прерываем.\n", Console::FG_RED);
-                    $this->printPushAllReport($totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
+                    $this->stderr("\n  ⚠ API '{$channel->name}' недоступен (3 подряд). Прерываем.\n", Console::FG_RED);
+                    $this->printPushAllReport($channel->name, $totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
                     return ExitCode::TEMPFAIL;
                 }
             }
 
-            // Освобождаем память
             gc_collect_cycles();
         }
 
         Console::endProgress("OK ✓\n");
 
-        // 6. Итоговый отчёт
-        $this->printPushAllReport($totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
+        $this->printPushAllReport($channel->name, $totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
 
         return $errorCount > 0 ? ExitCode::UNSPECIFIED_ERROR : ExitCode::OK;
     }
 
     /**
-     * Безопасная отправка батча проекций через API.
-     * При MarketplaceUnavailableException — подождёт и увеличит счётчик ошибок.
+     * Безопасная отправка батча через канало-специфичный клиент.
      */
-    private function pushBatchSafe(array $projections, int $apiFailures): array
-    {
+    private function pushBatchSafeChannel(
+        array $projections,
+        int $apiFailures,
+        SalesChannel $channel,
+        \common\services\channel\ApiClientInterface $apiClient
+    ): array {
         $success = 0;
         $errors = 0;
 
         try {
-            $results = $this->client->pushBatch($projections);
+            $results = $apiClient->pushBatch($projections, $channel);
 
             foreach ($results as $modelId => $ok) {
                 if ($ok) {
@@ -502,17 +605,15 @@ class ExportController extends Controller
                 }
             }
 
-            // Успешный запрос — сбрасываем счётчик неудач
             $apiFailures = 0;
 
         } catch (MarketplaceUnavailableException $e) {
             $apiFailures++;
             $errors += count($projections);
 
-            // Ждём с экспоненциальной задержкой
             $backoff = MarketplaceUnavailableException::calculateBackoff($apiFailures, 5, 60);
             Yii::warning(
-                "PushAll: API unavailable (fail #{$apiFailures}), backoff {$backoff}s: {$e->getMessage()}",
+                "PushAll [{$channel->name}]: API unavailable (fail #{$apiFailures}), backoff {$backoff}s: {$e->getMessage()}",
                 'marketplace.export'
             );
             sleep($backoff);
@@ -520,7 +621,7 @@ class ExportController extends Controller
         } catch (\Throwable $e) {
             $errors += count($projections);
             Yii::error(
-                "PushAll: batch error: {$e->getMessage()}",
+                "PushAll [{$channel->name}]: batch error: {$e->getMessage()}",
                 'marketplace.export'
             );
         }
@@ -533,17 +634,17 @@ class ExportController extends Controller
     }
 
     /**
-     * Красивый итоговый отчёт для push-all.
+     * Итоговый отчёт push-all для одного канала.
      */
     private function printPushAllReport(
-        int $totalModels, int $processed, int $successCount,
-        int $errorCount, int $skippedCount, float $startTime
+        string $channelName, int $totalModels, int $processed,
+        int $successCount, int $errorCount, int $skippedCount, float $startTime
     ): void {
         $duration = round(microtime(true) - $startTime, 1);
         $speed = $processed > 0 && $duration > 0 ? round($processed / $duration, 1) : 0;
 
         $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
-        $this->stdout("║   РЕЗУЛЬТАТ ПОЛНОЙ СИНХРОНИЗАЦИИ         ║\n", Console::FG_CYAN);
+        $this->stdout("║   РЕЗУЛЬТАТ: {$channelName}" . str_repeat(' ', max(0, 27 - mb_strlen($channelName))) . "║\n", Console::FG_CYAN);
         $this->stdout("╠══════════════════════════════════════════╣\n", Console::FG_CYAN);
         $this->stdout("║ Всего моделей:      " . str_pad($totalModels, 20) . "║\n");
         $this->stdout("║ Обработано:         " . str_pad($processed, 20) . "║\n");
@@ -565,8 +666,8 @@ class ExportController extends Controller
      * Использование:
      *   php yii export/sync-model --model=123
      *
-     * Строит проекцию и отправляет напрямую через RosMatrasApiClient.
-     * Полезно для отладки одной карточки.
+     * Использует legacy-клиент (RosMatras) для обратной совместимости.
+     * В будущем можно добавить --channel для конкретного канала.
      */
     public function actionSyncModel(): int
     {
@@ -579,22 +680,24 @@ class ExportController extends Controller
         $this->stdout("║   SYNC MODEL (E2E Test)                  ║\n", Console::FG_CYAN);
         $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
 
-        // 1. Проверяем доступность API
+        // Если указан канал — используем новую архитектуру
+        if ($this->channel) {
+            return $this->syncModelToChannel($this->model, $this->channel);
+        }
+
+        // Legacy: RosMatras напрямую
         $this->stdout("  1. Health check API... ", Console::FG_CYAN);
         try {
-            $healthy = $this->client->healthCheck();
+            $healthy = $this->legacyClient->healthCheck();
             if ($healthy) {
                 $this->stdout("OK ✓\n", Console::FG_GREEN);
             } else {
-                $this->stdout("WARN (health returned false, продолжаем...)\n", Console::FG_YELLOW);
+                $this->stdout("WARN (health returned false)\n", Console::FG_YELLOW);
             }
         } catch (\Throwable $e) {
-            $this->stdout("FAIL ✗\n", Console::FG_RED);
-            $this->stdout("     Ошибка: {$e->getMessage()}\n", Console::FG_RED);
-            $this->stdout("     Продолжаем всё равно...\n\n", Console::FG_YELLOW);
+            $this->stdout("FAIL ✗ ({$e->getMessage()})\n", Console::FG_RED);
         }
 
-        // 2. Строим проекцию
         $this->stdout("  2. Строим проекцию model_id={$this->model}... ", Console::FG_CYAN);
 
         $projection = $this->syndicator->buildProductProjection($this->model);
@@ -613,18 +716,15 @@ class ExportController extends Controller
         $this->stdout("     Изображений: " . count($projection['images']) . "\n");
         $this->stdout("     Размер JSON: " . $this->formatBytes(strlen(json_encode($projection))) . "\n\n");
 
-        // 3. Отправляем
         $this->stdout("  3. Отправляем на витрину... ", Console::FG_CYAN);
-
         $startTime = microtime(true);
 
         try {
-            $result = $this->client->pushProduct($this->model, $projection);
+            $result = $this->legacyClient->pushProduct($this->model, $projection);
             $duration = round((microtime(true) - $startTime) * 1000);
 
             if ($result) {
                 $this->stdout("OK ✓ ({$duration}ms)\n\n", Console::FG_GREEN);
-                $this->stdout("  ═══ СИНХРОНИЗАЦИЯ УСПЕШНА ═══\n\n", Console::FG_GREEN);
                 return ExitCode::OK;
             } else {
                 $this->stdout("FAIL — клиент вернул false.\n\n", Console::FG_RED);
@@ -634,7 +734,6 @@ class ExportController extends Controller
         } catch (MarketplaceUnavailableException $e) {
             $duration = round((microtime(true) - $startTime) * 1000);
             $this->stdout("API UNAVAILABLE ({$duration}ms)\n", Console::FG_RED);
-            $this->stdout("     HTTP: " . ($e->getHttpCode() ?? 'N/A') . "\n", Console::FG_RED);
             $this->stdout("     Ошибка: {$e->getMessage()}\n\n", Console::FG_RED);
             return ExitCode::TEMPFAIL;
 
@@ -647,53 +746,164 @@ class ExportController extends Controller
     }
 
     /**
-     * Проверить доступность API RosMatras.
-     *
-     * Использование:
-     *   php yii export/ping
+     * Синхронизировать одну модель на конкретный канал.
      */
-    public function actionPing(): int
+    private function syncModelToChannel(int $modelId, int $channelId): int
     {
-        $this->stdout("\n  Проверяем API RosMatras...\n\n", Console::FG_CYAN);
-
-        // Показываем конфигурацию
-        $params = Yii::$app->params['rosmatras'] ?? [];
-        $apiUrl = $params['apiUrl'] ?? 'не задан';
-        $hasToken = !empty($params['apiToken']);
-
-        $this->stdout("  URL:   {$apiUrl}\n");
-        $this->stdout("  Token: " . ($hasToken ? '✓ (установлен)' : '✗ (не установлен)') . "\n\n",
-            $hasToken ? Console::FG_GREEN : Console::FG_YELLOW);
-
-        if (empty($params['apiUrl'])) {
-            $this->stderr("  ✗ API URL не настроен. Задайте ROSMATRAS_API_URL в .env\n\n", Console::FG_RED);
-            return ExitCode::CONFIG;
+        $channel = SalesChannel::findOne($channelId);
+        if (!$channel) {
+            $this->stderr("  ✗ Канал #{$channelId} не найден.\n\n", Console::FG_RED);
+            return ExitCode::DATAERR;
         }
 
-        // Health check
-        $this->stdout("  Health check... ", Console::FG_CYAN);
+        $this->stdout("  Канал: {$channel->name} (driver={$channel->driver})\n\n", Console::FG_CYAN);
+
+        $syndicator = $this->factory->getSyndicator($channel);
+        $apiClient = $this->factory->getApiClient($channel);
+
+        $this->stdout("  1. Health check... ", Console::FG_CYAN);
+        try {
+            $healthy = $apiClient->healthCheck($channel);
+            $this->stdout($healthy ? "OK ✓\n" : "WARN\n", $healthy ? Console::FG_GREEN : Console::FG_YELLOW);
+        } catch (\Throwable $e) {
+            $this->stdout("FAIL ✗\n", Console::FG_RED);
+        }
+
+        $this->stdout("  2. Строим проекцию model_id={$modelId}... ", Console::FG_CYAN);
+        $projection = $syndicator->buildProjection($modelId, $channel);
+        if (!$projection) {
+            $this->stderr("FAIL\n\n", Console::FG_RED);
+            return ExitCode::DATAERR;
+        }
+        $this->stdout("OK ✓\n", Console::FG_GREEN);
+
+        $this->stdout("  3. Отправляем на '{$channel->name}'... ", Console::FG_CYAN);
         $startTime = microtime(true);
 
         try {
-            $healthy = $this->client->healthCheck();
+            $result = $apiClient->push($modelId, $projection, $channel);
             $duration = round((microtime(true) - $startTime) * 1000);
 
-            if ($healthy) {
+            if ($result) {
                 $this->stdout("OK ✓ ({$duration}ms)\n\n", Console::FG_GREEN);
-                $this->stdout("  ═══ API RosMatras ДОСТУПЕН ═══\n\n", Console::FG_GREEN);
                 return ExitCode::OK;
             } else {
-                $this->stdout("WARN ({$duration}ms) — health вернул false\n\n", Console::FG_YELLOW);
+                $this->stdout("FAIL ({$duration}ms)\n\n", Console::FG_RED);
                 return ExitCode::UNSPECIFIED_ERROR;
             }
-
         } catch (\Throwable $e) {
-            $duration = round((microtime(true) - $startTime) * 1000);
-            $this->stdout("FAIL ✗ ({$duration}ms)\n", Console::FG_RED);
-            $this->stdout("  Ошибка: {$e->getMessage()}\n\n", Console::FG_RED);
-            $this->stdout("  ═══ API RosMatras НЕДОСТУПЕН ═══\n\n", Console::FG_RED);
-            return ExitCode::UNAVAILABLE;
+            $this->stdout("ERROR: {$e->getMessage()}\n\n", Console::FG_RED);
+            return ExitCode::UNSPECIFIED_ERROR;
         }
+    }
+
+    /**
+     * Проверить доступность API всех каналов.
+     */
+    public function actionPing(): int
+    {
+        $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
+        $this->stdout("║   HEALTH CHECK: Все каналы               ║\n", Console::FG_CYAN);
+        $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
+
+        $channels = SalesChannel::findActive();
+
+        if (empty($channels)) {
+            $this->stdout("  Нет активных каналов.\n\n", Console::FG_YELLOW);
+            return ExitCode::OK;
+        }
+
+        $allOk = true;
+
+        foreach ($channels as $ch) {
+            $this->stdout("  {$ch->name} (driver={$ch->driver}): ", Console::FG_CYAN);
+
+            if (!$this->factory->hasDriver($ch->driver)) {
+                $this->stdout("SKIP (драйвер не зарегистрирован)\n", Console::FG_YELLOW);
+                continue;
+            }
+
+            $startTime = microtime(true);
+            try {
+                $apiClient = $this->factory->getApiClient($ch);
+                $healthy = $apiClient->healthCheck($ch);
+                $duration = round((microtime(true) - $startTime) * 1000);
+
+                if ($healthy) {
+                    $this->stdout("OK ✓ ({$duration}ms)\n", Console::FG_GREEN);
+                } else {
+                    $this->stdout("FAIL ✗ ({$duration}ms)\n", Console::FG_RED);
+                    $allOk = false;
+                }
+            } catch (\Throwable $e) {
+                $duration = round((microtime(true) - $startTime) * 1000);
+                $this->stdout("ERROR ({$duration}ms): {$e->getMessage()}\n", Console::FG_RED);
+                $allOk = false;
+            }
+        }
+
+        // Legacy-клиент
+        $this->stdout("\n  Legacy (RosMatras params): ", Console::FG_GREY);
+        $startTime = microtime(true);
+        try {
+            $healthy = $this->legacyClient->healthCheck();
+            $duration = round((microtime(true) - $startTime) * 1000);
+            $this->stdout($healthy ? "OK ✓ ({$duration}ms)\n" : "FAIL ({$duration}ms)\n",
+                $healthy ? Console::FG_GREEN : Console::FG_RED);
+        } catch (\Throwable $e) {
+            $this->stdout("ERROR: {$e->getMessage()}\n", Console::FG_RED);
+        }
+
+        $this->stdout("\n");
+
+        return $allOk ? ExitCode::OK : ExitCode::UNSPECIFIED_ERROR;
+    }
+
+    /**
+     * Список зарегистрированных каналов продаж.
+     */
+    public function actionChannels(): int
+    {
+        $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
+        $this->stdout("║   КАНАЛЫ ПРОДАЖ                          ║\n", Console::FG_CYAN);
+        $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
+
+        $channels = SalesChannel::find()->orderBy(['id' => SORT_ASC])->all();
+
+        if (empty($channels)) {
+            $this->stdout("  Нет каналов. Запустите миграции.\n\n", Console::FG_YELLOW);
+            return ExitCode::OK;
+        }
+
+        foreach ($channels as $ch) {
+            $status = $ch->is_active ? '✓ Active' : '✗ Inactive';
+            $hasDriver = $this->factory->hasDriver($ch->driver);
+            $driverStatus = $hasDriver ? '✓' : '✗ not registered';
+
+            $this->stdout("  [{$ch->id}] ", Console::FG_CYAN);
+            $this->stdout("{$ch->name}\n");
+            $this->stdout("      Driver:  {$ch->driver} ({$driverStatus})\n",
+                $hasDriver ? Console::FG_GREEN : Console::FG_RED);
+            $this->stdout("      Status:  {$status}\n",
+                $ch->is_active ? Console::FG_GREEN : Console::FG_GREY);
+
+            $config = is_string($ch->api_config) ? json_decode($ch->api_config, true) : $ch->api_config;
+            if (!empty($config)) {
+                $this->stdout("      Config:  ");
+                foreach ($config as $key => $value) {
+                    $displayVal = (stripos($key, 'token') !== false || stripos($key, 'key') !== false || stripos($key, 'secret') !== false)
+                        ? '***' . substr($value, -4)
+                        : $value;
+                    $this->stdout("{$key}={$displayVal} ");
+                }
+                $this->stdout("\n");
+            }
+            $this->stdout("\n");
+        }
+
+        $this->stdout("  Зарегистрированные драйверы: " . implode(', ', $this->factory->getRegisteredDrivers()) . "\n\n");
+
+        return ExitCode::OK;
     }
 
     // ═══════════════════════════════════════════
@@ -701,52 +911,47 @@ class ExportController extends Controller
     // ═══════════════════════════════════════════
 
     /**
-     * Показать статистику Outbox.
+     * Показать статистику Outbox (Multi-Channel).
      */
     public function actionStatus(): int
     {
         $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
-        $this->stdout("║   OUTBOX QUEUE STATUS                    ║\n", Console::FG_CYAN);
+        $this->stdout("║   OUTBOX QUEUE STATUS (Multi-Channel)    ║\n", Console::FG_CYAN);
         $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
 
+        // Общая статистика
         $stats = $this->outbox->getQueueStats();
 
-        $this->stdout("  Pending:    " . $stats['pending'] . "\n",
+        $this->stdout("  Общая:\n", Console::FG_CYAN);
+        $this->stdout("    Pending:    " . $stats['pending'] . "\n",
             $stats['pending'] > 0 ? Console::FG_YELLOW : Console::FG_GREEN);
-        $this->stdout("  Processing: " . $stats['processing'] . "\n",
+        $this->stdout("    Processing: " . $stats['processing'] . "\n",
             $stats['processing'] > 0 ? Console::FG_YELLOW : Console::FG_GREEN);
-        $this->stdout("  Success:    " . $stats['success'] . "\n", Console::FG_GREEN);
-        $this->stdout("  Error:      " . $stats['error'] . "\n",
+        $this->stdout("    Success:    " . $stats['success'] . "\n", Console::FG_GREEN);
+        $this->stdout("    Error:      " . $stats['error'] . "\n",
             $stats['error'] > 0 ? Console::FG_RED : Console::FG_GREEN);
 
-        $total = array_sum($stats);
-        $this->stdout("\n  Total: {$total}\n\n");
-
-        // Последние события
-        $db = Yii::$app->db;
-
-        $recent = $db->createCommand("
-            SELECT entity_type, event_type, count(*) as cnt
-            FROM {{%marketplace_outbox}}
-            WHERE created_at > NOW() - INTERVAL '1 hour'
-            GROUP BY entity_type, event_type
-            ORDER BY cnt DESC
-        ")->queryAll();
-
-        if (!empty($recent)) {
-            $this->stdout("  События за последний час:\n", Console::FG_CYAN);
-            foreach ($recent as $row) {
-                $this->stdout("    {$row['entity_type']}.{$row['event_type']}: {$row['cnt']}\n");
+        // По каналам
+        $channelStats = $this->outbox->getQueueStatsByChannel();
+        if (!empty($channelStats)) {
+            $this->stdout("\n  По каналам:\n", Console::FG_CYAN);
+            foreach ($channelStats as $channelName => $statuses) {
+                $pending = $statuses['pending'] ?? 0;
+                $errors = $statuses['error'] ?? 0;
+                $success = $statuses['success'] ?? 0;
+                $this->stdout("    {$channelName}: P={$pending} S={$success} E={$errors}\n",
+                    $errors > 0 ? Console::FG_YELLOW : Console::FG_GREEN);
             }
-            $this->stdout("\n");
         }
+
+        $db = Yii::$app->db;
 
         // Уникальные модели в pending
         $pendingModels = $db->createCommand("
             SELECT COUNT(DISTINCT model_id) FROM {{%marketplace_outbox}} WHERE status = 'pending'
         ")->queryScalar();
 
-        $this->stdout("  Уникальных моделей в pending: {$pendingModels}\n");
+        $this->stdout("\n  Уникальных моделей в pending: {$pendingModels}\n");
 
         // Error-записи с retry_count
         $errorStats = $db->createCommand("
@@ -769,30 +974,20 @@ class ExportController extends Controller
     }
 
     /**
-     * Повторить error-записи с экспоненциальной задержкой.
-     *
-     * Записи с большим retry_count будут ждать дольше:
-     *   retry_count=1 → сразу в pending
-     *   retry_count=2 → только если прошло 5 минут
-     *   retry_count=3 → только если прошло 20 минут
-     *   retry_count=4 → только если прошло 1 час
-     *   retry_count>=5 → не ретраить (dead letter)
+     * Повторить error-записи.
      */
     public function actionRetryErrors(): int
     {
         $this->stdout("\n  Retry error-записей (maxRetries={$this->maxRetries})...\n\n", Console::FG_CYAN);
 
         $db = Yii::$app->db;
-
-        // Retry с учётом exponential backoff по retry_count
         $totalRetried = 0;
 
-        // Разные уровни: чем больше retry_count, тем старше должна быть запись
         $levels = [
-            1 => '0 minutes',    // retry_count=1: сразу
-            2 => '5 minutes',    // retry_count=2: ждём 5 мин
-            3 => '20 minutes',   // retry_count=3: ждём 20 мин
-            4 => '60 minutes',   // retry_count=4: ждём 1 час
+            1 => '0 minutes',
+            2 => '5 minutes',
+            3 => '20 minutes',
+            4 => '60 minutes',
         ];
 
         foreach ($levels as $retryCount => $interval) {
@@ -813,7 +1008,6 @@ class ExportController extends Controller
             }
         }
 
-        // Dead letters — показать, сколько не ретраим
         $deadLetters = $db->createCommand("
             SELECT COUNT(*) FROM {{%marketplace_outbox}}
             WHERE status = 'error' AND retry_count >= :max
@@ -822,7 +1016,7 @@ class ExportController extends Controller
         if ($totalRetried > 0) {
             $this->stdout("\n  ✓ Итого возвращено в pending: {$totalRetried}\n", Console::FG_GREEN);
         } else {
-            $this->stdout("  Нет записей для retry (или ещё не прошло достаточно времени).\n", Console::FG_YELLOW);
+            $this->stdout("  Нет записей для retry.\n", Console::FG_YELLOW);
         }
 
         if ($deadLetters > 0) {
@@ -834,7 +1028,7 @@ class ExportController extends Controller
     }
 
     /**
-     * Предпросмотр проекции модели (не отправляет на витрину).
+     * Предпросмотр проекции модели (не отправляет).
      */
     public function actionPreview(): int
     {
@@ -852,21 +1046,17 @@ class ExportController extends Controller
             return ExitCode::DATAERR;
         }
 
-        // Красивый вывод
         $this->stdout("  Название: {$projection['name']}\n", Console::BOLD);
         $this->stdout("  Бренд:    " . ($projection['brand']['name'] ?? 'N/A') . "\n");
         $this->stdout("  Семейство: {$projection['product_family']}\n");
         $this->stdout("  Slug:     {$projection['slug']}\n");
         $this->stdout("  Цена:     " . ($projection['best_price'] ? number_format($projection['best_price'], 0, '.', ' ') . '₽' : 'N/A') . "\n");
-        $this->stdout("  Диапазон: " .
-            ($projection['price_range_min'] ? number_format($projection['price_range_min'], 0, '.', ' ') : '?') . " - " .
-            ($projection['price_range_max'] ? number_format($projection['price_range_max'], 0, '.', ' ') : '?') . "₽\n");
         $this->stdout("  В наличии: " . ($projection['is_in_stock'] ? 'Да' : 'Нет') . "\n");
+        $this->stdout("  Активна:   " . ($projection['is_active'] ? 'Да' : 'Нет') . "\n");
         $this->stdout("  Вариантов: {$projection['variant_count']}\n");
         $this->stdout("  Офферов:   {$projection['offer_count']}\n");
         $this->stdout("  Изображений: " . count($projection['images']) . "\n");
 
-        // Selector Axes
         $axes = $projection['selector_axes'] ?? [];
         if (!empty($axes)) {
             $this->stdout("\n  Selector Axes:\n", Console::FG_CYAN);
@@ -880,7 +1070,6 @@ class ExportController extends Controller
             }
         }
 
-        // Варианты
         $this->stdout("\n  Варианты:\n", Console::FG_CYAN);
         foreach ($projection['variants'] as $v) {
             $price = $v['best_price'] ? number_format($v['best_price'], 0, '.', ' ') . '₽' : 'N/A';
@@ -889,7 +1078,6 @@ class ExportController extends Controller
             $this->stdout("    [{$v['id']}] {$v['label']} — {$price} {$stock} ({$offers} офферов)\n");
         }
 
-        // Полный JSON
         $jsonStr = json_encode($projection, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
         $this->stdout("\n  Полный JSON ({$this->formatBytes(strlen($jsonStr))}): \n\n", Console::FG_GREY);
         $this->stdout($jsonStr . "\n\n");
@@ -937,8 +1125,6 @@ class ExportController extends Controller
     /**
      * Вернуть outbox-записи обратно в pending.
      *
-     * Используется при MarketplaceUnavailableException — не теряем данные.
-     *
      * @param int[] $outboxIds
      */
     private function rollbackToPending(array $outboxIds): void
@@ -959,23 +1145,22 @@ class ExportController extends Controller
     }
 
     /**
-     * Вернуть оставшиеся (необработанные) модели из текущего батча в pending.
+     * Вернуть оставшиеся (необработанные) группы обратно в pending.
      *
-     * @param array<int, array> $grouped   Все модели текущего батча
-     * @param int               $failedModelId  ID модели, на которой случился сбой
+     * @param array<string, array> $grouped       Все группы текущего батча
+     * @param string               $failedKey     Ключ группы, на которой случился сбой
      */
-    private function rollbackRemainingModels(array $grouped, int $failedModelId): void
+    private function rollbackRemainingGroups(array $grouped, string $failedKey): void
     {
         $allRemainingIds = [];
         $found = false;
 
-        foreach ($grouped as $modelId => $events) {
-            if ($modelId === $failedModelId) {
+        foreach ($grouped as $key => $events) {
+            if ($key === $failedKey) {
                 $found = true;
-                continue; // Текущая модель уже обработана в вызывающем коде
+                continue;
             }
             if ($found) {
-                // Все модели ПОСЛЕ failedModelId — ещё не обработаны
                 $allRemainingIds = array_merge($allRemainingIds, array_column($events, 'id'));
             }
         }
