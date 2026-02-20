@@ -2,7 +2,6 @@
 
 namespace common\jobs;
 
-use common\services\ImportService;
 use common\services\ImportStagingService;
 use yii\base\BaseObject;
 use yii\queue\JobInterface;
@@ -10,24 +9,23 @@ use yii\queue\Queue;
 use Yii;
 
 /**
- * Фаза 4: Bulk-запись из Redis staging → PostgreSQL.
+ * Фаза 4: Bulk-запись из PostgreSQL staging → боевые таблицы.
  *
- * Итерирует по нормализованным товарам в Redis, конвертирует
- * обратно в ProductDTO и записывает через ImportService.
+ * Итерирует по staging_raw_offers со статусом 'normalized',
+ * десериализует в ProductDTO и записывает в product_cards + supplier_offers.
  *
- * Преимущества:
- * - Данные уже нормализованы (бренды, категории, названия)
- * - Bulk-запись батчами (50 за транзакцию)
- * - Redis staging очищается после завершения
+ * Cursor-based iteration (WHERE id > :lastId), каждый товар в своей транзакции.
+ * После persist — статус строки в staging меняется на 'persisted'.
  *
- * После завершения ставит в очередь:
+ * После завершения ставит:
  * - DownloadImagesJob (картинки)
  * - AI-обогащение (бренды, категории, описания)
  */
 class PersistStagedJob extends BaseObject implements JobInterface
 {
-    public string $taskId;
-    public string $supplierCode;
+    public string $sessionId = '';
+    public string $supplierCode = '';
+    public int $supplierId = 0;
 
     /** @var bool Скачивать ли картинки */
     public bool $downloadImages = true;
@@ -38,81 +36,105 @@ class PersistStagedJob extends BaseObject implements JobInterface
     /** @var int Размер батча для записи в БД */
     public int $batchSize = 50;
 
+    // Обратная совместимость
+    public string $taskId = '';
+
+    public function init(): void
+    {
+        parent::init();
+        if (!empty($this->taskId) && empty($this->sessionId)) {
+            $this->sessionId = $this->taskId;
+        }
+    }
+
     public function execute($queue): void
     {
-        Yii::info("PersistStagedJob: старт taskId={$this->taskId}", 'import');
+        Yii::info("PersistStagedJob: старт sessionId={$this->sessionId}", 'import');
 
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
+        $staging->setStatus($this->sessionId, 'persisting');
 
-        /** @var ImportService $importService */
-        $importService = Yii::$app->get('importService');
-
-        $staging->setStatus($this->taskId, 'persisting');
-        $meta = $staging->getMeta($this->taskId);
         $startTime = microtime(true);
+        $db = Yii::$app->db;
+
+        // Получаем supplierId
+        if ($this->supplierId <= 0) {
+            $this->supplierId = $this->ensureSupplier($db);
+        }
+
+        $totalInStaging = $staging->getItemCount($this->sessionId, 'normalized');
+        Yii::info("PersistStagedJob: items to persist = {$totalInStaging}", 'import');
 
         $stats = [
-            'cards_created' => 0,
-            'cards_updated' => 0,
+            'cards_created'  => 0,
+            'cards_updated'  => 0,
             'offers_created' => 0,
             'offers_updated' => 0,
             'variants_total' => 0,
-            'errors' => 0,
-            'persisted' => 0,
+            'errors'         => 0,
+            'persisted'      => 0,
         ];
 
-        $db = Yii::$app->db;
-        $supplierId = $this->ensureSupplier($db);
-
-        $batchBuffer = [];
-        $totalProcessed = 0;
-
-        $itemCount = $staging->getItemCount($this->taskId);
-        Yii::info("PersistStagedJob: items in staging = {$itemCount}", 'import');
+        $persistedIds = [];
 
         try {
-            $iterCount = 0;
-            foreach ($staging->iterateProducts($this->taskId, 300) as $sku => $data) {
-                $iterCount++;
+            foreach ($staging->iterateNormalized($this->sessionId, 500) as $rowId => $row) {
                 try {
-                    $dto = $staging->deserializeToDTO($data);
-                    $batchBuffer[] = $dto;
+                    $dto = $staging->deserializeToDTO(
+                        $row['raw_data'],
+                        $row['normalized_data']
+                    );
 
-                    if (count($batchBuffer) >= $this->batchSize) {
-                        $this->persistBatch($importService, $batchBuffer, $supplierId, $stats);
-                        $totalProcessed += count($batchBuffer);
-                        $batchBuffer = [];
+                    $tx = $db->beginTransaction();
+                    $result = $this->persistProduct($dto, $this->supplierId);
+                    $tx->commit();
 
-                        if ($totalProcessed % 200 === 0) {
-                            $elapsed = round(microtime(true) - $startTime, 1);
-                            $ratePerSec = $totalProcessed > 0 ? round($totalProcessed / $elapsed) : 0;
-                            Yii::info(
-                                "PersistStagedJob: прогресс persisted={$totalProcessed}/{$itemCount} " .
-                                "rate={$ratePerSec}/s elapsed={$elapsed}s " .
-                                "cards_c={$stats['cards_created']} cards_u={$stats['cards_updated']}",
-                                'import'
-                            );
-                        }
+                    $stats[$result['action']]++;
+                    $stats[$result['offer_action']]++;
+                    $stats['variants_total'] += $result['variants'];
+                    $stats['persisted']++;
 
-                        if ($totalProcessed % 2000 === 0) {
-                            gc_collect_cycles();
-                        }
+                    $persistedIds[] = $rowId;
+
+                    // Batch-обновление статуса staging
+                    if (count($persistedIds) >= 100) {
+                        $staging->markPersistedBatch($persistedIds);
+                        $persistedIds = [];
                     }
+
+                    if ($stats['persisted'] % 200 === 0) {
+                        $elapsed = round(microtime(true) - $startTime, 1);
+                        $rate = $stats['persisted'] > 0 ? round($stats['persisted'] / max($elapsed, 0.1)) : 0;
+                        Yii::info(
+                            "PersistStagedJob: прогресс persisted={$stats['persisted']}/{$totalInStaging} " .
+                            "rate={$rate}/s cards_c={$stats['cards_created']} cards_u={$stats['cards_updated']}",
+                            'import'
+                        );
+                    }
+
+                    if ($stats['persisted'] % 2000 === 0) {
+                        gc_collect_cycles();
+                    }
+
                 } catch (\Throwable $e) {
+                    if (isset($tx) && $tx->getIsActive()) {
+                        $tx->rollBack();
+                    }
                     $stats['errors']++;
+                    $staging->markError($rowId, $e->getMessage());
                     if ($stats['errors'] <= 30) {
-                        Yii::warning("PersistStagedJob: ошибка SKU={$sku}: {$e->getMessage()}", 'import');
+                        Yii::warning(
+                            "PersistStagedJob: ошибка row={$rowId}: {$e->getMessage()}",
+                            'import'
+                        );
                     }
                 }
             }
 
-            Yii::info("PersistStagedJob: iterator yielded {$iterCount} items, processed {$totalProcessed}", 'import');
-
-            // Остаток
-            if (!empty($batchBuffer)) {
-                $this->persistBatch($importService, $batchBuffer, $supplierId, $stats);
-                $totalProcessed += count($batchBuffer);
+            // Остаток persisted ids
+            if (!empty($persistedIds)) {
+                $staging->markPersistedBatch($persistedIds);
             }
 
         } catch (\Throwable $e) {
@@ -121,6 +143,7 @@ class PersistStagedJob extends BaseObject implements JobInterface
         }
 
         $duration = round(microtime(true) - $startTime, 1);
+        $rate = $stats['persisted'] > 0 ? round($stats['persisted'] / max($duration, 0.1)) : 0;
 
         // Обновляем last_import_at для поставщика
         $db->createCommand()->update(
@@ -129,19 +152,20 @@ class PersistStagedJob extends BaseObject implements JobInterface
             ['code' => $this->supplierCode]
         )->execute();
 
-        $staging->updateMeta($this->taskId, [
-            'status' => 'completed',
-            'persisted_at' => date('Y-m-d H:i:s'),
-            'persist_duration_sec' => $duration,
-            'persist_stats' => $stats,
+        $staging->updateStats($this->sessionId, [
+            'persisted_items'       => $stats['persisted'],
+            'persist_duration_sec'  => $duration,
+            'persist_rate'          => $rate,
+            'persist_stats'         => $stats,
         ]);
+        $staging->setStatus($this->sessionId, 'completed');
 
         Yii::info(
             "PersistStagedJob: завершён — " .
             "created={$stats['cards_created']} updated={$stats['cards_updated']} " .
             "offers_new={$stats['offers_created']} offers_upd={$stats['offers_updated']} " .
             "variants={$stats['variants_total']} errors={$stats['errors']} " .
-            "time={$duration}s",
+            "rate={$rate}/s time={$duration}s",
             'import'
         );
 
@@ -155,64 +179,16 @@ class PersistStagedJob extends BaseObject implements JobInterface
         if ($this->runAIEnrichment && $hasNewCards) {
             $this->enqueueAIProcessing();
         }
-
-        // Очистка Redis staging (через 1 час, на случай дебага)
-        $staging->updateMeta($this->taskId, [
-            'cleanup_scheduled_at' => date('Y-m-d H:i:s', time() + 3600),
-        ]);
-        // Можно оставить staging на время, если нужна повторная обработка
-        // $staging->cleanup($this->taskId);
-
-        // Сокращаем TTL до 2 часов (данные уже в БД)
-        $staging->refreshTtl($this->taskId);
-    }
-
-    /**
-     * Записать батч товаров в PostgreSQL.
-     * Каждый товар в своём SAVEPOINT, чтобы одна ошибка не убивала всю транзакцию.
-     */
-    protected function persistBatch(ImportService $importService, array $dtos, int $supplierId, array &$stats): void
-    {
-        $db = Yii::$app->db;
-
-        // Каждый товар в своей транзакции — надёжнее при unique constraint violations
-        foreach ($dtos as $dto) {
-            try {
-                $tx = $db->beginTransaction();
-                $result = $this->persistProduct($importService, $dto, $supplierId);
-                $tx->commit();
-                $stats[$result['action']]++;
-                $stats[$result['offer_action']]++;
-                $stats['variants_total'] += $result['variants'];
-                $stats['persisted']++;
-            } catch (\Throwable $e) {
-                if (isset($tx) && $tx->getIsActive()) {
-                    $tx->rollBack();
-                }
-                $stats['errors']++;
-                if ($stats['errors'] <= 30) {
-                    Yii::warning(
-                        "PersistStagedJob: ошибка persist sku={$dto->supplierSku}: {$e->getMessage()}",
-                        'import'
-                    );
-                }
-            }
-        }
     }
 
     /**
      * Сохранить один товар в БД (карточка + оффер + картинки).
      */
-    public function persistProduct(?ImportService $importService, $dto, int $supplierId): array
+    public function persistProduct($dto, int $supplierId): array
     {
-        // Используем рефлексию, чтобы вызвать protected-метод ImportService
-        // Или можно сделать processProduct публичным.
-        // Пока используем прямой SQL для максимальной скорости.
-
         $variantCount = count($dto->variants);
         $db = Yii::$app->db;
 
-        // Ищем карточку по manufacturer + model
         $manufacturer = $dto->manufacturer ?? 'Unknown';
         $modelName = $dto->model ?? $dto->name;
 
@@ -231,15 +207,14 @@ class PersistStagedJob extends BaseObject implements JobInterface
 
         $offerAction = $this->upsertOffer($db, $dto, (int)$cardId, $supplierId);
 
-        // Ставим картинки в очередь
         if (!empty($dto->imageUrls)) {
             $this->enqueueImages($db, (int)$cardId, $dto->imageUrls);
         }
 
         return [
-            'action' => $isNewCard ? 'cards_created' : 'cards_updated',
+            'action'       => $isNewCard ? 'cards_created' : 'cards_updated',
             'offer_action' => $offerAction,
-            'variants' => $variantCount,
+            'variants'     => $variantCount,
         ];
     }
 
@@ -249,7 +224,6 @@ class PersistStagedJob extends BaseObject implements JobInterface
         $modelName = $dto->model ?? $dto->name;
         $baseSlug = $this->slugify($manufacturer . '-' . $modelName);
 
-        // Уникальный slug: проверяем, если уже есть — добавляем суффикс
         $slug = $baseSlug;
         $suffix = 0;
         while ($db->createCommand("SELECT 1 FROM {{%product_cards}} WHERE slug = :slug", [':slug' => $slug])->queryScalar()) {
@@ -261,25 +235,25 @@ class PersistStagedJob extends BaseObject implements JobInterface
         $maxPrice = $dto->getMaxPrice();
 
         $db->createCommand()->insert('{{%product_cards}}', [
-            'canonical_name' => $dto->name,
-            'slug' => $slug,
-            'manufacturer' => $manufacturer,
-            'model' => $modelName,
-            'description' => $dto->description,
+            'canonical_name'       => $dto->name,
+            'slug'                 => $slug,
+            'manufacturer'         => $manufacturer,
+            'model'                => $modelName,
+            'description'          => $dto->description,
             'canonical_attributes' => json_encode($dto->attributes, JSON_UNESCAPED_UNICODE),
-            'canonical_images' => json_encode($dto->imageUrls, JSON_UNESCAPED_UNICODE),
-            'price_range_min' => $minPrice,
-            'price_range_max' => $maxPrice,
-            'best_price' => $minPrice,
-            'total_variants' => count($dto->variants),
-            'image_count' => count($dto->imageUrls),
-            'is_in_stock' => $dto->inStock,
-            'supplier_count' => 1,
-            'source_supplier' => $this->supplierCode,
-            'status' => 'active',
-            'quality_score' => 50,
-            'is_published' => true,
-            'has_active_offers' => $dto->inStock,
+            'canonical_images'     => json_encode($dto->imageUrls, JSON_UNESCAPED_UNICODE),
+            'price_range_min'      => $minPrice,
+            'price_range_max'      => $maxPrice,
+            'best_price'           => $minPrice,
+            'total_variants'       => count($dto->variants),
+            'image_count'          => count($dto->imageUrls),
+            'is_in_stock'          => $dto->inStock,
+            'supplier_count'       => 1,
+            'source_supplier'      => $this->supplierCode,
+            'status'               => 'active',
+            'quality_score'        => 50,
+            'is_published'         => true,
+            'has_active_offers'    => $dto->inStock,
         ])->execute();
 
         return (int)$db->getLastInsertID('product_cards_id_seq');
@@ -318,12 +292,12 @@ class PersistStagedJob extends BaseObject implements JobInterface
     public function upsertOffer($db, $dto, int $cardId, int $supplierId): string
     {
         $variantsJson = json_encode(array_map(fn($v) => [
-            'sku' => $v->sku,
-            'price' => $v->price,
+            'sku'          => $v->sku,
+            'price'        => $v->price,
             'compare_price' => $v->comparePrice,
-            'in_stock' => $v->inStock,
+            'in_stock'     => $v->inStock,
             'stock_status' => $v->stockStatus,
-            'options' => $v->options,
+            'options'      => $v->options,
         ], $dto->variants), JSON_UNESCAPED_UNICODE);
 
         $checksum = $dto->getChecksum();
@@ -375,21 +349,21 @@ class PersistStagedJob extends BaseObject implements JobInterface
         ";
 
         $row = $db->createCommand($sql, [
-            ':card_id' => $cardId,
-            ':supplier_id' => $supplierId,
-            ':sku' => $dto->supplierSku,
-            ':price_min' => $dto->getMinPrice(),
-            ':price_max' => $dto->getMaxPrice(),
+            ':card_id'       => $cardId,
+            ':supplier_id'   => $supplierId,
+            ':sku'           => $dto->supplierSku,
+            ':price_min'     => $dto->getMinPrice(),
+            ':price_max'     => $dto->getMaxPrice(),
             ':compare_price' => $comparePrice,
-            ':in_stock' => $dto->inStock ? 'true' : 'false',
-            ':stock_status' => $dto->stockStatus,
-            ':description' => $dto->description,
-            ':attributes' => json_encode($dto->attributes, JSON_UNESCAPED_UNICODE),
-            ':images' => json_encode($dto->imageUrls, JSON_UNESCAPED_UNICODE),
-            ':variants' => $variantsJson,
+            ':in_stock'      => $dto->inStock ? 'true' : 'false',
+            ':stock_status'  => $dto->stockStatus,
+            ':description'   => $dto->description,
+            ':attributes'    => json_encode($dto->attributes, JSON_UNESCAPED_UNICODE),
+            ':images'        => json_encode($dto->imageUrls, JSON_UNESCAPED_UNICODE),
+            ':variants'      => $variantsJson,
             ':variant_count' => count($dto->variants),
-            ':checksum' => $checksum,
-            ':raw_data' => json_encode($dto->rawData, JSON_UNESCAPED_UNICODE),
+            ':checksum'      => $checksum,
+            ':raw_data'      => json_encode($dto->rawData, JSON_UNESCAPED_UNICODE),
         ])->queryOne();
 
         return ($row['is_insert'] ?? false) ? 'offers_created' : 'offers_updated';
@@ -424,10 +398,10 @@ class PersistStagedJob extends BaseObject implements JobInterface
 
         if (!$id) {
             $db->createCommand()->insert('{{%suppliers}}', [
-                'name' => ucfirst($this->supplierCode),
-                'code' => $this->supplierCode,
+                'name'      => ucfirst($this->supplierCode),
+                'code'      => $this->supplierCode,
                 'is_active' => true,
-                'format' => 'xml',
+                'format'    => 'xml',
             ])->execute();
             $id = $db->getLastInsertID('suppliers_id_seq');
         }
@@ -447,7 +421,7 @@ class PersistStagedJob extends BaseObject implements JobInterface
         $chunks = array_chunk($cardIds, 10);
         foreach ($chunks as $chunk) {
             Yii::$app->queue->push(new DownloadImagesJob([
-                'cardIds' => $chunk,
+                'cardIds'      => $chunk,
                 'supplierCode' => $this->supplierCode,
             ]));
         }
@@ -458,7 +432,6 @@ class PersistStagedJob extends BaseObject implements JobInterface
     {
         $db = Yii::$app->db;
 
-        // Бренды без brand_id
         $unbrandedIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
             WHERE brand_id IS NULL AND (brand IS NOT NULL OR manufacturer IS NOT NULL)
@@ -471,7 +444,6 @@ class PersistStagedJob extends BaseObject implements JobInterface
             }
         }
 
-        // Без категории
         $uncategorizedIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
             WHERE category_id IS NULL ORDER BY created_at DESC LIMIT 200
@@ -483,7 +455,6 @@ class PersistStagedJob extends BaseObject implements JobInterface
             }
         }
 
-        // Обогащение низкокачественных карточек
         $lowQualityIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
             WHERE quality_score < 50 ORDER BY quality_score ASC, created_at DESC LIMIT 50
@@ -491,12 +462,6 @@ class PersistStagedJob extends BaseObject implements JobInterface
 
         foreach ($lowQualityIds as $cardId) {
             Yii::$app->queue->push(new EnrichCardJob(['cardId' => (int)$cardId]));
-        }
-
-        $totalJobs = count($unbrandedIds) + count($uncategorizedIds) + count($lowQualityIds);
-        if ($totalJobs > 0) {
-            Yii::info("PersistStagedJob: поставлено AI-заданий: бренды=" . count($unbrandedIds) .
-                " категории=" . count($uncategorizedIds) . " обогащение=" . count($lowQualityIds), 'import');
         }
     }
 

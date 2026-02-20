@@ -14,27 +14,19 @@ use Yii;
  *
  * Поддерживает два режима:
  *
- * 1. **PIPELINE** (новый, по умолчанию):
- *    Parse → Redis staging → AI recipe → Normalize → Bulk persist → Background jobs
- *    Быстрый, масштабируемый, с AI-нормализацией.
+ * 1. **PIPELINE** (по умолчанию):
+ *    Parse → PostgreSQL UNLOGGED staging → AI recipe → Normalize → Bulk persist
+ *    Масштабируемый, с cursor-based итерацией, без ограничений Redis.
  *
  * 2. **LEGACY** (прямой):
- *    Parse → ImportService → PostgreSQL (потоково, без Redis)
+ *    Parse → ImportService → PostgreSQL (потоково, без staging)
  *    Простой, без дополнительных зависимостей.
  *
  * Использование:
- *   // Pipeline (рекомендуется):
  *   Yii::$app->queue->push(new ImportPriceJob([
  *       'supplierCode' => 'ormatek',
  *       'filePath' => '/app/storage/prices/ormatek/All.xml',
- *       'mode' => 'pipeline',
- *   ]));
- *
- *   // Legacy:
- *   Yii::$app->queue->push(new ImportPriceJob([
- *       'supplierCode' => 'ormatek',
- *       'filePath' => '/app/storage/prices/ormatek/All.xml',
- *       'mode' => 'legacy',
+ *       'mode' => 'pipeline',  // или 'legacy'
  *   ]));
  */
 class ImportPriceJob extends BaseObject implements JobInterface
@@ -51,7 +43,7 @@ class ImportPriceJob extends BaseObject implements JobInterface
     /** @var bool Скачивать ли картинки */
     public bool $downloadImages = true;
 
-    /** @var string Режим: 'pipeline' (Redis staging) или 'legacy' (прямой) */
+    /** @var string Режим: 'pipeline' (PostgreSQL staging) или 'legacy' (прямой) */
     public string $mode = 'pipeline';
 
     /** @var bool Использовать ли AI-анализ в pipeline-режиме */
@@ -75,44 +67,57 @@ class ImportPriceJob extends BaseObject implements JobInterface
     }
 
     // ═══════════════════════════════════════════
-    // PIPELINE MODE (Redis staging)
+    // PIPELINE MODE (PostgreSQL UNLOGGED staging)
     // ═══════════════════════════════════════════
 
-    /**
-     * Pipeline: создаёт задачу staging и ставит StagePriceJob.
-     *
-     * Дальше цепочка:
-     * StagePriceJob → AnalyzePriceJob → NormalizeStagedJob → PersistStagedJob
-     */
     protected function executePipeline(Queue $queue): void
     {
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
 
-        // Создаём задачу
-        $taskId = $staging->createTask($this->supplierCode, $this->filePath, $this->options);
+        // Получаем supplier_id
+        $supplierId = Yii::$app->db->createCommand(
+            "SELECT id FROM {{%suppliers}} WHERE code = :code",
+            [':code' => $this->supplierCode]
+        )->queryScalar();
 
-        Yii::info("ImportPriceJob: pipeline taskId={$taskId}", 'queue');
+        if (!$supplierId) {
+            Yii::$app->db->createCommand()->insert('{{%suppliers}}', [
+                'name'      => ucfirst($this->supplierCode),
+                'code'      => $this->supplierCode,
+                'is_active' => true,
+                'format'    => 'xml',
+            ])->execute();
+            $supplierId = (int)Yii::$app->db->getLastInsertID('suppliers_id_seq');
+        }
+
+        // Создаём сессию
+        $sessionId = $staging->createSession(
+            $this->supplierCode,
+            (int)$supplierId,
+            $this->filePath,
+            $this->options
+        );
+
+        Yii::info("ImportPriceJob: pipeline sessionId={$sessionId}", 'queue');
 
         // Ставим первую фазу в очередь
         Yii::$app->queue->push(new StagePriceJob([
             'supplierCode' => $this->supplierCode,
-            'filePath' => $this->filePath,
-            'taskId' => $taskId,
-            'options' => $this->options,
+            'filePath'     => $this->filePath,
+            'sessionId'    => $sessionId,
+            'supplierId'   => (int)$supplierId,
+            'options'      => $this->options,
             'analyzeWithAI' => $this->analyzeWithAI,
         ]));
 
-        Yii::info("ImportPriceJob: StagePriceJob поставлен в очередь (taskId={$taskId})", 'queue');
+        Yii::info("ImportPriceJob: StagePriceJob поставлен в очередь (sessionId={$sessionId})", 'queue');
     }
 
     // ═══════════════════════════════════════════
     // LEGACY MODE (прямой ImportService)
     // ═══════════════════════════════════════════
 
-    /**
-     * Legacy: прямой импорт через ImportService → PostgreSQL.
-     */
     protected function executeLegacy(Queue $queue): void
     {
         /** @var ImportService $importService */
@@ -126,12 +131,10 @@ class ImportPriceJob extends BaseObject implements JobInterface
 
         $hasNewCards = ($stats['cards_created'] > 0 || $stats['cards_updated'] > 0);
 
-        // Скачивание картинок
         if ($this->downloadImages && $hasNewCards) {
             $this->enqueueImageDownload($stats);
         }
 
-        // AI-обработка
         if ($hasNewCards) {
             $this->enqueueAIProcessing();
         }
@@ -141,9 +144,7 @@ class ImportPriceJob extends BaseObject implements JobInterface
     {
         $cardIds = Yii::$app->db->createCommand("
             SELECT DISTINCT card_id FROM {{%card_images}} 
-            WHERE status = 'pending' 
-            ORDER BY card_id 
-            LIMIT 500
+            WHERE status = 'pending' ORDER BY card_id LIMIT 500
         ")->queryColumn();
 
         if (empty($cardIds)) return;
@@ -151,12 +152,10 @@ class ImportPriceJob extends BaseObject implements JobInterface
         $chunks = array_chunk($cardIds, 10);
         foreach ($chunks as $chunk) {
             Yii::$app->queue->push(new DownloadImagesJob([
-                'cardIds' => $chunk,
+                'cardIds'      => $chunk,
                 'supplierCode' => $this->supplierCode,
             ]));
         }
-
-        Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на скачку картинок", 'queue');
     }
 
     protected function enqueueAIProcessing(): void
@@ -166,46 +165,33 @@ class ImportPriceJob extends BaseObject implements JobInterface
         $unbrandedIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
             WHERE brand_id IS NULL AND (brand IS NOT NULL OR manufacturer IS NOT NULL)
-            ORDER BY created_at DESC
-            LIMIT 200
+            ORDER BY created_at DESC LIMIT 200
         ")->queryColumn();
 
         if (!empty($unbrandedIds)) {
-            $chunks = array_chunk($unbrandedIds, 20);
-            foreach ($chunks as $chunk) {
+            foreach (array_chunk($unbrandedIds, 20) as $chunk) {
                 Yii::$app->queue->push(new ResolveBrandsJob(['cardIds' => $chunk]));
             }
-            Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на резолв брендов", 'queue');
         }
 
         $uncategorizedIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
-            WHERE category_id IS NULL
-            ORDER BY created_at DESC
-            LIMIT 200
+            WHERE category_id IS NULL ORDER BY created_at DESC LIMIT 200
         ")->queryColumn();
 
         if (!empty($uncategorizedIds)) {
-            $chunks = array_chunk($uncategorizedIds, 10);
-            foreach ($chunks as $chunk) {
+            foreach (array_chunk($uncategorizedIds, 10) as $chunk) {
                 Yii::$app->queue->push(new CategorizeCardsJob(['cardIds' => $chunk]));
             }
-            Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на категоризацию", 'queue');
         }
 
         $lowQualityIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
-            WHERE quality_score < 50
-            ORDER BY quality_score ASC, created_at DESC
-            LIMIT 50
+            WHERE quality_score < 50 ORDER BY quality_score ASC, created_at DESC LIMIT 50
         ")->queryColumn();
 
         foreach ($lowQualityIds as $cardId) {
             Yii::$app->queue->push(new EnrichCardJob(['cardId' => (int)$cardId]));
-        }
-
-        if (!empty($lowQualityIds)) {
-            Yii::info("ImportPriceJob: поставлено " . count($lowQualityIds) . " заданий на AI-обогащение", 'queue');
         }
     }
 }

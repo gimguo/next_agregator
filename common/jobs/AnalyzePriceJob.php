@@ -2,6 +2,7 @@
 
 namespace common\jobs;
 
+use common\models\SupplierAiRecipe;
 use common\services\AIService;
 use common\services\ImportStagingService;
 use yii\base\BaseObject;
@@ -12,60 +13,110 @@ use Yii;
 /**
  * Фаза 2: AI-анализ выборки из staging → рецепт нормализации.
  *
- * Берёт 30-50 товаров из Redis staging, отправляет в DeepSeek,
- * получает «рецепт» — правила маппинга брендов, категорий,
- * нормализации названий. Сохраняет рецепт обратно в Redis.
+ * Кэширование рецептов:
+ *   1. Проверяем supplier_ai_recipes — есть ли активный рецепт для поставщика.
+ *   2. Если ЕСТЬ и !forceRegenerate → используем кэш (0 запросов к AI, 0 секунд, $0).
+ *   3. Если НЕТ или forceRegenerate → генерируем через DeepSeek:
+ *      - Берём 40-50 случайных товаров из staging_raw_offers
+ *      - Отправляем в AI, получаем рецепт
+ *      - Сохраняем в supplier_ai_recipes для будущих импортов
+ *
+ * Экономия: при ежедневном импорте 10 поставщиков — $0.03-0.10/день → $0.
  *
  * После завершения ставит в очередь NormalizeStagedJob (фаза 3).
- *
- * Стоимость: ~1 запрос к AI ($0.003-0.01).
  */
 class AnalyzePriceJob extends BaseObject implements JobInterface
 {
-    public string $taskId;
-    public string $supplierCode;
+    public string $sessionId = '';
+    public string $supplierCode = '';
+    public int $supplierId = 0;
 
     /** @var int Размер выборки для AI */
     public int $sampleSize = 40;
 
+    /** @var bool Принудительная генерация рецепта (игнорировать кэш) */
+    public bool $forceRegenerate = false;
+
+    // Обратная совместимость
+    public string $taskId = '';
+
+    public function init(): void
+    {
+        parent::init();
+        if (!empty($this->taskId) && empty($this->sessionId)) {
+            $this->sessionId = $this->taskId;
+        }
+    }
+
     public function execute($queue): void
     {
-        Yii::info("AnalyzePriceJob: старт taskId={$this->taskId}", 'import');
+        Yii::info("AnalyzePriceJob: старт sessionId={$this->sessionId} forceRegenerate=" . ($this->forceRegenerate ? 'yes' : 'no'), 'import');
 
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
-
-        /** @var AIService $ai */
-        $ai = Yii::$app->get('aiService');
-
-        $staging->setStatus($this->taskId, 'analyzing');
+        $staging->setStatus($this->sessionId, 'analyzing');
 
         try {
-            // Проверяем, доступен ли AI
+            // ═══ ШАГ 1: ПРОВЕРЯЕМ КЭШ РЕЦЕПТОВ ═══
+            if (!$this->forceRegenerate) {
+                $cachedRecipe = SupplierAiRecipe::findActiveForSupplier($this->supplierId);
+
+                if ($cachedRecipe) {
+                    $recipe = $cachedRecipe->toNormalizeRecipe();
+
+                    Yii::info(
+                        "AnalyzePriceJob: используем кэшированный рецепт v{$cachedRecipe->recipe_version} " .
+                        "для supplier_id={$this->supplierId} (сэкономлено: ~{$cachedRecipe->ai_duration_sec}s, ~{$cachedRecipe->ai_tokens_used} токенов)",
+                        'import'
+                    );
+
+                    $staging->updateStats($this->sessionId, [
+                        'recipe'              => $recipe,
+                        'ai_cached'           => true,
+                        'ai_recipe_version'   => $cachedRecipe->recipe_version,
+                        'ai_duration_sec'     => 0,
+                        'ai_tokens_saved'     => $cachedRecipe->ai_tokens_used ?? 0,
+                    ]);
+                    $staging->setStatus($this->sessionId, 'analyzed');
+
+                    $this->enqueueNextPhase($recipe);
+                    return;
+                }
+
+                Yii::info("AnalyzePriceJob: кэш рецепта не найден для supplier_id={$this->supplierId}, генерируем новый", 'import');
+            } else {
+                Yii::info("AnalyzePriceJob: forceRegenerate=true, генерируем новый рецепт", 'import');
+            }
+
+            // ═══ ШАГ 2: ПРОВЕРЯЕМ ДОСТУПНОСТЬ AI ═══
+            /** @var AIService $ai */
+            $ai = Yii::$app->get('aiService');
+
             if (!$ai->isAvailable()) {
                 Yii::warning("AnalyzePriceJob: AI недоступен, пропускаем анализ", 'import');
-                $staging->updateMeta($this->taskId, [
-                    'analyzed_at' => date('Y-m-d H:i:s'),
-                    'ai_skipped' => true,
+                $staging->updateStats($this->sessionId, [
+                    'ai_skipped'     => true,
                     'ai_skip_reason' => 'AI service unavailable',
                 ]);
-
-                // Переходим к фазе 3 без рецепта
-                $this->enqueueNextPhase($staging);
+                $staging->setStatus($this->sessionId, 'analyzed');
+                $this->enqueueNextPhase();
                 return;
             }
 
-            // Получаем сэмпл товаров из Redis
-            $sample = $staging->getSample($this->taskId, $this->sampleSize);
+            // ═══ ШАГ 3: ГЕНЕРАЦИЯ НОВОГО РЕЦЕПТА ═══
+
+            // Получаем случайный сэмпл из staging_raw_offers
+            $sample = $staging->getSample($this->sessionId, $this->sampleSize);
             if (empty($sample)) {
                 Yii::warning("AnalyzePriceJob: staging пуст", 'import');
-                $staging->setStatus($this->taskId, 'failed');
+                $staging->setStatus($this->sessionId, 'failed');
+                $staging->updateStats($this->sessionId, ['error_message' => 'Staging is empty']);
                 return;
             }
 
-            // Собираем контекст: уникальные бренды и категории
-            $uniqueBrands = $staging->getBrands($this->taskId);
-            $uniqueCategories = $staging->getCategories($this->taskId);
+            // Бренды и категории через SQL-агрегацию
+            $uniqueBrands = $staging->getBrands($this->sessionId);
+            $uniqueCategories = $staging->getCategories($this->sessionId);
 
             // Существующие бренды и категории из БД
             $existingBrands = Yii::$app->db->createCommand(
@@ -83,66 +134,84 @@ class AnalyzePriceJob extends BaseObject implements JobInterface
             // Вызываем AI
             $startTime = microtime(true);
             $recipe = $ai->generateImportRecipe(
-                sampleProducts: $sample,
-                existingBrands: $existingBrands,
+                sampleProducts:     $sample,
+                existingBrands:     $existingBrands,
                 existingCategories: $catMap,
-                uniqueBrands: $uniqueBrands,
-                uniqueCategories: $uniqueCategories,
+                uniqueBrands:       $uniqueBrands,
+                uniqueCategories:   $uniqueCategories,
             );
-            $aiDuration = round(microtime(true) - $startTime, 1);
+            $aiDuration = round(microtime(true) - $startTime, 2);
 
             if (empty($recipe)) {
                 Yii::warning("AnalyzePriceJob: AI вернул пустой рецепт", 'import');
-                $staging->updateMeta($this->taskId, [
-                    'analyzed_at' => date('Y-m-d H:i:s'),
-                    'ai_skipped' => true,
-                    'ai_skip_reason' => 'Empty recipe from AI',
+                $staging->updateStats($this->sessionId, [
+                    'ai_skipped'      => true,
+                    'ai_skip_reason'  => 'Empty recipe from AI',
                     'ai_duration_sec' => $aiDuration,
                 ]);
-            } else {
-                // Сохраняем рецепт в Redis
-                $staging->setRecipe($this->taskId, $recipe);
-
-                $brandMappings = count($recipe['brand_mapping'] ?? []);
-                $categoryMappings = count($recipe['category_mapping'] ?? []);
-                $insights = $recipe['insights'] ?? [];
-
-                $staging->updateMeta($this->taskId, [
-                    'status' => 'analyzed',
-                    'analyzed_at' => date('Y-m-d H:i:s'),
-                    'ai_duration_sec' => $aiDuration,
-                    'recipe_brand_mappings' => $brandMappings,
-                    'recipe_category_mappings' => $categoryMappings,
-                    'recipe_data_quality' => $insights['data_quality'] ?? null,
-                    'recipe_notes' => $insights['notes'] ?? [],
-                ]);
-
-                Yii::info(
-                    "AnalyzePriceJob: рецепт готов — brands={$brandMappings} categories={$categoryMappings} " .
-                    "quality=" . ($insights['data_quality'] ?? '?') . " time={$aiDuration}s",
-                    'import'
-                );
+                $staging->setStatus($this->sessionId, 'analyzed');
+                $this->enqueueNextPhase();
+                return;
             }
 
+            // ═══ ШАГ 4: СОХРАНЯЕМ РЕЦЕПТ В КЭШ (supplier_ai_recipes) ═══
+            $savedRecipe = SupplierAiRecipe::saveFromAIResponse(
+                $this->supplierId,
+                $this->supplierCode,
+                $recipe,
+                [
+                    'sample_size'     => count($sample),
+                    'ai_model'        => 'deepseek-chat',
+                    'ai_duration_sec' => $aiDuration,
+                    'ai_tokens_used'  => null, // TODO: получить из AI response
+                ]
+            );
+
+            $brandMappings = count($recipe['brand_mapping'] ?? []);
+            $categoryMappings = count($recipe['category_mapping'] ?? []);
+            $insights = $recipe['insights'] ?? [];
+
+            Yii::info(
+                "AnalyzePriceJob: рецепт сгенерирован и закэширован (v{$savedRecipe->recipe_version}) — " .
+                "brands={$brandMappings} categories={$categoryMappings} " .
+                "quality=" . ($insights['data_quality'] ?? '?') . " time={$aiDuration}s",
+                'import'
+            );
+
+            // Сохраняем рецепт и в stats сессии
+            $staging->updateStats($this->sessionId, [
+                'recipe'                   => $recipe,
+                'ai_cached'                => false,
+                'ai_recipe_version'        => $savedRecipe->recipe_version,
+                'ai_duration_sec'          => $aiDuration,
+                'recipe_brand_mappings'    => $brandMappings,
+                'recipe_category_mappings' => $categoryMappings,
+                'recipe_data_quality'      => $insights['data_quality'] ?? null,
+                'recipe_notes'             => $insights['notes'] ?? [],
+            ]);
+            $staging->setStatus($this->sessionId, 'analyzed');
+
             // Фаза 3: нормализация
-            $this->enqueueNextPhase($staging);
+            $this->enqueueNextPhase($recipe);
 
         } catch (\Throwable $e) {
             Yii::error("AnalyzePriceJob: ошибка — {$e->getMessage()}", 'import');
-            $staging->updateMeta($this->taskId, [
+            $staging->updateStats($this->sessionId, [
                 'ai_error' => $e->getMessage(),
-                'analyzed_at' => date('Y-m-d H:i:s'),
             ]);
             // Продолжаем без AI — не блокируем пайплайн
-            $this->enqueueNextPhase($staging);
+            $staging->setStatus($this->sessionId, 'analyzed');
+            $this->enqueueNextPhase();
         }
     }
 
-    private function enqueueNextPhase(ImportStagingService $staging): void
+    private function enqueueNextPhase(array $recipe = []): void
     {
         Yii::$app->queue->push(new NormalizeStagedJob([
-            'taskId' => $this->taskId,
+            'sessionId'    => $this->sessionId,
             'supplierCode' => $this->supplierCode,
+            'supplierId'   => $this->supplierId,
+            'recipe'       => $recipe,
         ]));
         Yii::info("AnalyzePriceJob: поставлен NormalizeStagedJob в очередь", 'import');
     }

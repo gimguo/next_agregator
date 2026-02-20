@@ -71,6 +71,11 @@ class CategorizeCardsJob extends BaseObject implements JobInterface
                         $updateData['product_type'] = $result['product_type'];
                     }
 
+                    // Сохраняем product_family если AI определил
+                    if (!empty($result['product_family'])) {
+                        $updateData['product_type'] = $result['product_family'];
+                    }
+
                     $db->createCommand()->update('{{%product_cards}}', $updateData, ['id' => $cardId])->execute();
                     $categorized++;
                 } else {

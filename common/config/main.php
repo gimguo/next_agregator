@@ -54,7 +54,7 @@ return [
         // Быстрое хранилище для парсинга → нормализации → bulk persist
         'importStaging' => [
             'class' => \common\services\ImportStagingService::class,
-            'ttl' => 86400, // 24 часа
+            'cleanupHours' => 48, // Авто-очистка сессий старше 48 часов
         ],
 
         // ═══ Получение прайсов (FTP, URL, Email, API) ═══

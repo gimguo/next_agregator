@@ -2,6 +2,7 @@
 
 namespace common\jobs;
 
+use common\enums\ProductFamily;
 use common\services\ImportStagingService;
 use yii\base\BaseObject;
 use yii\queue\JobInterface;
@@ -9,35 +10,56 @@ use yii\queue\Queue;
 use Yii;
 
 /**
- * Фаза 3: Нормализация данных в Redis staging.
+ * Фаза 3: Нормализация данных в PostgreSQL staging.
  *
- * Применяет AI-рецепт (или базовые правила) ко всем товарам:
- * - Маппинг брендов (грязное → каноническое)
- * - Маппинг категорий
- * - Нормализация названий
- * - Определение типа товара
+ * Читает пачки из staging_raw_offers со статусом 'pending',
+ * применяет AI-рецепт (или базовые правила), записывает
+ * normalized_data и меняет статус на 'normalized'.
  *
- * Работает целиком в Redis — без SQL-запросов.
+ * Cursor-based итерация через `WHERE id > :lastId` — стабильно и быстро.
+ *
  * После завершения ставит в очередь PersistStagedJob (фаза 4).
  */
 class NormalizeStagedJob extends BaseObject implements JobInterface
 {
-    public string $taskId;
-    public string $supplierCode;
+    public string $sessionId = '';
+    public string $supplierCode = '';
+    public int $supplierId = 0;
+
+    /** @var array AI-рецепт (может быть передан напрямую) */
+    public array $recipe = [];
+
+    // Обратная совместимость
+    public string $taskId = '';
+
+    public function init(): void
+    {
+        parent::init();
+        if (!empty($this->taskId) && empty($this->sessionId)) {
+            $this->sessionId = $this->taskId;
+        }
+    }
 
     public function execute($queue): void
     {
-        Yii::info("NormalizeStagedJob: старт taskId={$this->taskId}", 'import');
+        Yii::info("NormalizeStagedJob: старт sessionId={$this->sessionId}", 'import');
 
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
-        $staging->setStatus($this->taskId, 'normalizing');
+        $staging->setStatus($this->sessionId, 'normalizing');
 
         $startTime = microtime(true);
-        $recipe = $staging->getRecipe($this->taskId);
+
+        // Рецепт может быть передан напрямую или загружен из session stats
+        $recipe = $this->recipe;
+        if (empty($recipe)) {
+            $session = $staging->getSession($this->sessionId);
+            $stats = json_decode($session['stats'] ?? '{}', true) ?: [];
+            $recipe = $stats['recipe'] ?? [];
+        }
         $hasRecipe = !empty($recipe);
 
-        // Подготавливаем маппинги из рецепта
+        // Подготавливаем маппинги
         $brandMapping = $this->buildBrandMapping($recipe);
         $categoryMapping = $this->buildCategoryMapping($recipe);
         $nameRules = $recipe['name_rules'] ?? [];
@@ -46,49 +68,67 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
 
         $normalized = 0;
         $errors = 0;
+        $updateBatch = [];
+        $batchFlushSize = 100;
 
-        // Проходим по всем товарам в Redis (HSCAN)
-        foreach ($staging->iterateProducts($this->taskId, 300) as $sku => $data) {
+        // Cursor-based итерация по pending записям
+        foreach ($staging->iteratePending($this->sessionId, 500) as $rowId => $row) {
             try {
-                $data = $this->normalizeItem($data, $brandMapping, $categoryMapping, $nameRules, $nameTemplate, $productTypeRules);
-                $data['_normalized'] = true;
+                $data = $row['raw_data'];
+                $normalizedData = $this->normalizeItem(
+                    $data, $brandMapping, $categoryMapping,
+                    $nameRules, $nameTemplate, $productTypeRules
+                );
 
-                // Записываем обратно в Redis
-                $staging->stageRaw($this->taskId, $sku, $data);
+                $updateBatch[] = [$rowId, $normalizedData];
                 $normalized++;
+
+                // Flush batch
+                if (count($updateBatch) >= $batchFlushSize) {
+                    $staging->markNormalizedBatch($updateBatch);
+                    $updateBatch = [];
+                }
 
                 if ($normalized % 5000 === 0) {
                     Yii::info("NormalizeStagedJob: прогресс normalized={$normalized}", 'import');
                 }
             } catch (\Throwable $e) {
                 $errors++;
+                $staging->markError($rowId, $e->getMessage());
                 if ($errors <= 20) {
-                    Yii::warning("NormalizeStagedJob: ошибка SKU={$sku}: {$e->getMessage()}", 'import');
+                    Yii::warning("NormalizeStagedJob: ошибка row={$rowId}: {$e->getMessage()}", 'import');
                 }
             }
         }
 
-        $duration = round(microtime(true) - $startTime, 1);
+        // Остаток
+        if (!empty($updateBatch)) {
+            $staging->markNormalizedBatch($updateBatch);
+        }
 
-        $staging->updateMeta($this->taskId, [
-            'status' => 'normalized',
-            'normalized_at' => date('Y-m-d H:i:s'),
+        $duration = round(microtime(true) - $startTime, 1);
+        $rate = $normalized > 0 ? round($normalized / max($duration, 0.1)) : 0;
+
+        $staging->updateStats($this->sessionId, [
+            'normalized_items'       => $normalized,
             'normalize_duration_sec' => $duration,
-            'normalized_count' => $normalized,
-            'normalize_errors' => $errors,
-            'has_recipe' => $hasRecipe,
+            'normalize_rate'         => $rate,
+            'normalize_errors'       => $errors,
+            'has_recipe'             => $hasRecipe,
         ]);
+        $staging->setStatus($this->sessionId, 'normalized');
 
         Yii::info(
             "NormalizeStagedJob: завершён — normalized={$normalized} errors={$errors} " .
-            "recipe=" . ($hasRecipe ? 'yes' : 'no') . " time={$duration}s",
+            "recipe=" . ($hasRecipe ? 'yes' : 'no') . " rate={$rate}/s time={$duration}s",
             'import'
         );
 
-        // Фаза 4: запись в PostgreSQL
+        // Фаза 4: запись в PostgreSQL (боевые таблицы)
         Yii::$app->queue->push(new PersistStagedJob([
-            'taskId' => $this->taskId,
+            'sessionId'    => $this->sessionId,
             'supplierCode' => $this->supplierCode,
+            'supplierId'   => $this->supplierId,
         ]));
         Yii::info("NormalizeStagedJob: поставлен PersistStagedJob в очередь", 'import');
     }
@@ -110,21 +150,24 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
 
         // 1. Нормализация бренда
         $canonicalBrand = $this->normalizeBrand($brand, $brandMapping);
-        $data['_brand_canonical'] = $canonicalBrand;
 
         // 2. Маппинг категории
         $categoryMapped = $this->normalizeCategory($category, $categoryMapping);
-        $data['_category_mapped'] = $categoryMapped;
 
         // 3. Нормализация имени
         $canonicalName = $this->normalizeName($model, $canonicalBrand, $nameRules, $nameTemplate);
-        $data['_canonical_name'] = $canonicalName;
 
-        // 4. Тип продукта
+        // 4. Тип продукта (через ProductFamily enum)
         $productType = $this->detectProductType($canonicalName, $category, $productTypeRules);
-        $data['_product_type'] = $productType;
 
-        return $data;
+        return [
+            '_canonical_name'  => $canonicalName,
+            '_brand_canonical' => $canonicalBrand,
+            '_category_mapped' => $categoryMapped,
+            '_product_type'    => $productType,
+            '_product_family'  => ProductFamily::detect($canonicalName . ' ' . $category)->value,
+            '_normalized'      => true,
+        ];
     }
 
     /**
@@ -134,16 +177,13 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
     {
         if (empty($raw)) return '';
 
-        // Точное совпадение
         $key = mb_strtolower(trim($raw), 'UTF-8');
         if (isset($mapping[$key])) {
             return $mapping[$key];
         }
 
-        // Базовая нормализация: capitalize, trim
         $normalized = mb_convert_case(trim($raw), MB_CASE_TITLE, 'UTF-8');
 
-        // Известные паттерны
         $fixes = [
             'ОРМАТЭК' => 'Орматек',
             'Орматэк' => 'Орматек',
@@ -166,7 +206,6 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
             return $mapping[$key];
         }
 
-        // Возвращаем как есть, если маппинга нет
         return trim($raw);
     }
 
@@ -177,7 +216,6 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
     {
         $name = trim($model);
 
-        // Убираем бренд из начала названия (если дублируется)
         if (!empty($brand) && ($rules['remove_brand_prefix'] ?? true)) {
             $brandLower = mb_strtolower($brand, 'UTF-8');
             $nameLower = mb_strtolower($name, 'UTF-8');
@@ -186,7 +224,6 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
             }
         }
 
-        // Убираем лишние пробелы
         if ($rules['trim_whitespace'] ?? true) {
             $name = preg_replace('/\s+/u', ' ', $name);
         }
@@ -195,7 +232,6 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
             $name = $model;
         }
 
-        // Применяем шаблон
         $canonical = str_replace(
             ['{brand}', '{model}'],
             [$brand, $name],
@@ -206,46 +242,27 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
     }
 
     /**
-     * Определение типа товара по названию/категории.
+     * Определение типа товара.
      */
     protected function detectProductType(string $name, string $category, array $rules): ?string
     {
         $text = mb_strtolower($name . ' ' . $category, 'UTF-8');
 
-        // Сначала по AI-правилам
         foreach ($rules as $rule) {
             $pattern = mb_strtolower($rule['pattern'] ?? '', 'UTF-8');
-            if ($pattern && str_contains($text, $pattern)) {
-                return $rule['type'];
+            $family = $rule['family'] ?? $rule['type'] ?? null;
+            if ($pattern && $family && str_contains($text, $pattern)) {
+                return $family;
             }
         }
 
-        // Базовые правила
-        $defaultRules = [
-            'матрас' => 'mattress',
-            'подушк' => 'pillow',
-            'одеяло' => 'blanket',
-            'кроват' => 'bed',
-            'наматрасник' => 'protector',
-            'основани' => 'base',
-            'топпер' => 'topper',
-            'чехол' => 'cover',
-            'простын' => 'sheet',
-            'покрывал' => 'bedspread',
-        ];
-
-        foreach ($defaultRules as $keyword => $type) {
-            if (str_contains($text, $keyword)) {
-                return $type;
-            }
-        }
-
-        return null;
+        // Через ProductFamily enum
+        $detected = ProductFamily::detect($text);
+        return $detected !== ProductFamily::UNKNOWN ? $detected->value : null;
     }
 
     /**
      * Построить маппинг брендов из рецепта.
-     * Ключи — lowercase, значения — канонические.
      */
     public function buildBrandMapping(?array $recipe): array
     {
@@ -267,7 +284,6 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
 
     /**
      * Построить маппинг категорий из рецепта.
-     * Ключи — lowercase, значения — целевое имя.
      */
     public function buildCategoryMapping(?array $recipe): array
     {

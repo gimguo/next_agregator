@@ -50,21 +50,13 @@ class EnrichCardJob extends BaseObject implements JobInterface
         Yii::info("EnrichCardJob: старт card={$this->cardId} '{$card['canonical_name']}'", 'queue');
 
         $updateData = [];
+        $aiModel = $ai->getModelInfo()['model'] ?? 'deepseek';
 
         // 1. Извлечение атрибутов
         try {
             $attributes = $ai->extractAttributes($card['canonical_name'], $card['description'] ?? '');
             if ($attributes) {
-                // Сохраняем атрибуты в card_data_sources
-                $db->createCommand()->upsert('{{%card_data_sources}}', [
-                    'card_id' => $this->cardId,
-                    'source_type' => 'ai_attributes',
-                    'source_id' => 'deepseek',
-                    'data' => json_encode($attributes, JSON_UNESCAPED_UNICODE),
-                    'priority' => 50,
-                ], [
-                    'data' => json_encode($attributes, JSON_UNESCAPED_UNICODE),
-                ])->execute();
+                $this->saveDataSource($db, 'ai_attributes', $aiModel, $attributes, 50);
             }
         } catch (\Throwable $e) {
             Yii::warning("EnrichCardJob: extractAttributes error: {$e->getMessage()}", 'queue');
@@ -82,6 +74,10 @@ class EnrichCardJob extends BaseObject implements JobInterface
                 );
                 if ($description && mb_strlen($description) > 50) {
                     $updateData['description'] = $description;
+                    $this->saveDataSource($db, 'ai_enrichment', $aiModel, [
+                        'type' => 'description',
+                        'description' => $description,
+                    ], 50);
                 }
             } catch (\Throwable $e) {
                 Yii::warning("EnrichCardJob: generateDescription error: {$e->getMessage()}", 'queue');
@@ -100,17 +96,55 @@ class EnrichCardJob extends BaseObject implements JobInterface
                 'variant_count' => (int)$card['total_variants'],
             ]);
             if ($quality && isset($quality['score'])) {
-                $updateData['quality_score'] = min(100, max(0, (int)$quality['score']));
+                $score = min(100, max(0, (int)$quality['score']));
+                $updateData['quality_score'] = $score;
+                $this->saveDataSource($db, 'ai_enrichment', $aiModel . ':quality', [
+                    'type' => 'quality',
+                    'score' => $score,
+                    'details' => $quality,
+                ], 50, isset($quality['confidence']) ? (float)$quality['confidence'] : null);
             }
         } catch (\Throwable $e) {
             Yii::warning("EnrichCardJob: analyzeQuality error: {$e->getMessage()}", 'queue');
         }
 
-        // Применяем обновления
+        // Применяем обновления к карточке
         if (!empty($updateData)) {
             $db->createCommand()->update('{{%product_cards}}', $updateData, ['id' => $this->cardId])->execute();
         }
 
         Yii::info("EnrichCardJob: завершён card={$this->cardId} updates=" . count($updateData), 'queue');
+    }
+
+    /**
+     * Сохранить/обновить запись в полиморфной card_data_sources.
+     *
+     * Уникальность по (card_id, source_type, source_id).
+     * При повторном вызове — обновляет data и updated_at.
+     */
+    protected function saveDataSource(
+        $db,
+        string $sourceType,
+        string $sourceId,
+        array $data,
+        int $priority = 50,
+        ?float $confidence = null
+    ): void {
+        $jsonData = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+        $db->createCommand()->upsert('{{%card_data_sources}}', [
+            'card_id'     => $this->cardId,
+            'source_type' => $sourceType,
+            'source_id'   => $sourceId,
+            'data'        => $jsonData,
+            'priority'    => $priority,
+            'confidence'  => $confidence,
+            'created_at'  => new \yii\db\Expression('NOW()'),
+            'updated_at'  => new \yii\db\Expression('NOW()'),
+        ], [
+            'data'       => $jsonData,
+            'confidence' => $confidence,
+            'updated_at' => new \yii\db\Expression('NOW()'),
+        ])->execute();
     }
 }

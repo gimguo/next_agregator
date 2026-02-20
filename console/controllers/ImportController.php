@@ -4,7 +4,9 @@ namespace console\controllers;
 
 use common\jobs\DownloadImagesJob;
 use common\jobs\ImportPriceJob;
-use common\jobs\StagePriceJob;
+use common\jobs\NormalizeStagedJob;
+use common\jobs\PersistStagedJob;
+use common\models\SupplierAiRecipe;
 use common\services\ImportService;
 use common\services\ImportStagingService;
 use yii\console\Controller;
@@ -17,9 +19,9 @@ use Yii;
  *
  * Примеры:
  *   yii import/run ormatek /app/storage/prices/ormatek/All.xml         -- legacy (прямой)
- *   yii import/pipeline ormatek /app/storage/prices/ormatek/All.xml    -- pipeline (Redis staging)
+ *   yii import/pipeline ormatek /app/storage/prices/ormatek/All.xml    -- pipeline (PostgreSQL staging)
  *   yii import/queue ormatek /app/storage/prices/ormatek/All.xml       -- pipeline в очередь
- *   yii import/staging-status                                           -- статус staging-задач
+ *   yii import/staging-status                                           -- статус staging-сессий
  *   yii import/images
  *   yii import/stats
  */
@@ -43,7 +45,7 @@ class ImportController extends Controller
     }
 
     /**
-     * Синхронный импорт LEGACY (прямой SQL, без Redis).
+     * Синхронный импорт LEGACY (прямой SQL, без staging).
      *
      * @param string $supplier Код поставщика: ormatek
      * @param string $file Путь к файлу прайса
@@ -74,7 +76,7 @@ class ImportController extends Controller
     }
 
     /**
-     * Pipeline-импорт: Parse → Redis → AI → Normalize → Persist.
+     * Pipeline-импорт: Parse → PostgreSQL staging → AI → Normalize → Persist.
      *
      * Синхронный (все фазы в одном процессе, для тестирования).
      *
@@ -99,125 +101,191 @@ class ImportController extends Controller
 
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
+        $db = Yii::$app->db;
 
-        // ═══ ФАЗА 1: ПАРСИНГ → REDIS ═══
-        $this->stdout("═══ Фаза 1: Парсинг → Redis ═══\n", Console::FG_YELLOW);
-        $taskId = $staging->createTask($supplier, $file, $options);
-        $this->stdout("  Task ID: {$taskId}\n");
+        // Получаем/создаём supplier
+        $supplierId = $db->createCommand(
+            "SELECT id FROM {{%suppliers}} WHERE code = :code",
+            [':code' => $supplier]
+        )->queryScalar();
+
+        if (!$supplierId) {
+            $db->createCommand()->insert('{{%suppliers}}', [
+                'name'      => ucfirst($supplier),
+                'code'      => $supplier,
+                'is_active' => true,
+                'format'    => 'xml',
+            ])->execute();
+            $supplierId = (int)$db->getLastInsertID('suppliers_id_seq');
+        }
+        $supplierId = (int)$supplierId;
+
+        // ═══ ФАЗА 1: ПАРСИНГ → PostgreSQL UNLOGGED TABLE ═══
+        $this->stdout("═══ Фаза 1: Парсинг → PostgreSQL staging ═══\n", Console::FG_YELLOW);
+
+        $sessionId = $staging->createSession($supplier, $supplierId, $file, $options);
+        $this->stdout("  Session ID: {$sessionId}\n");
 
         $parserRegistry = Yii::$app->get('parserRegistry');
         $parser = $parserRegistry->get($supplier);
         if (!$parser) {
             $this->stderr("  Парсер не найден для '{$supplier}'\n", Console::FG_RED);
+            $staging->setStatus($sessionId, 'failed');
             return ExitCode::DATAERR;
         }
 
-        $staging->setStatus($taskId, 'parsing');
+        $staging->setStatus($sessionId, 'parsing');
         $startPhase = microtime(true);
         $totalProducts = 0;
         $batchBuffer = [];
+        $batchSize = 500;
 
         foreach ($parser->parse($file, $options) as $productDTO) {
             $batchBuffer[] = $productDTO;
             $totalProducts++;
 
-            if (count($batchBuffer) >= 200) {
-                $staging->stageBatch($taskId, $batchBuffer);
+            if (count($batchBuffer) >= $batchSize) {
+                $staging->insertBatch($sessionId, $supplierId, $batchBuffer);
                 $batchBuffer = [];
                 $this->stdout("  Parsed: {$totalProducts} товаров...\r");
             }
+
+            if ($this->max > 0 && $totalProducts >= $this->max) {
+                break;
+            }
         }
         if (!empty($batchBuffer)) {
-            $staging->stageBatch($taskId, $batchBuffer);
+            $staging->insertBatch($sessionId, $supplierId, $batchBuffer);
         }
 
         $parseDuration = round(microtime(true) - $startPhase, 1);
-        $brandCount = count($staging->getBrands($taskId));
-        $catCount = count($staging->getCategories($taskId));
 
-        $staging->updateMeta($taskId, [
-            'status' => 'parsed',
-            'total_items' => $totalProducts,
-            'parsed_at' => date('Y-m-d H:i:s'),
+        // Бренды/категории через SQL-агрегацию
+        $uniqueBrands = $staging->getBrands($sessionId);
+        $uniqueCategories = $staging->getCategories($sessionId);
+
+        $staging->updateStats($sessionId, [
+            'total_items'        => $totalProducts,
+            'parsed_items'       => $totalProducts,
             'parse_duration_sec' => $parseDuration,
         ]);
+        $staging->setStatus($sessionId, 'parsed');
 
+        $parseRate = $totalProducts > 0 ? round($totalProducts / max($parseDuration, 0.1)) : 0;
         $this->stdout("  Parsed: {$totalProducts} товаров                    \n");
-        $this->stdout("  Брендов: {$brandCount} | Категорий: {$catCount}\n");
-        $this->stdout("  Время: {$parseDuration}s\n", Console::FG_GREEN);
+        $this->stdout("  Брендов: " . count($uniqueBrands) . " | Категорий: " . count($uniqueCategories) . "\n");
+        $this->stdout("  Скорость: {$parseRate}/s, Время: {$parseDuration}s\n", Console::FG_GREEN);
         $this->stdout("\n");
 
-        // ═══ ФАЗА 2: AI-АНАЛИЗ ═══
+        // ═══ ФАЗА 2: AI-АНАЛИЗ (с кэшированием рецептов) ═══
         $aiDuration = 0;
+        $recipe = [];
         if ($this->ai && $totalProducts > 0) {
             $this->stdout("═══ Фаза 2: AI-анализ рецепта ═══\n", Console::FG_YELLOW);
-            $ai = Yii::$app->get('aiService');
 
-            if ($ai->isAvailable()) {
-                $staging->setStatus($taskId, 'analyzing');
-                $startPhase = microtime(true);
+            // Сначала проверяем кэш рецептов
+            $cachedRecipe = SupplierAiRecipe::findActiveForSupplier($supplierId);
 
-                $sample = $staging->getSample($taskId, 40);
-                $this->stdout("  Сэмпл: " . count($sample) . " товаров\n");
+            if ($cachedRecipe) {
+                $recipe = $cachedRecipe->toNormalizeRecipe();
+                $this->stdout("  ✓ Рецепт найден в кэше (v{$cachedRecipe->recipe_version})\n", Console::FG_GREEN);
+                $this->stdout("  Brand mappings: " . count($recipe['brand_mapping'] ?? []) . "\n");
+                $this->stdout("  Category mappings: " . count($recipe['category_mapping'] ?? []) . "\n");
+                $this->stdout("  Качество данных: " . ($cachedRecipe->data_quality ?? '?') . "\n");
+                $this->stdout("  AI не вызывался — сэкономлено ~{$cachedRecipe->ai_duration_sec}s\n", Console::FG_GREEN);
 
-                $existingBrands = Yii::$app->db->createCommand(
-                    "SELECT canonical_name FROM {{%brands}} WHERE is_active = true"
-                )->queryColumn();
-
-                $existingCats = Yii::$app->db->createCommand(
-                    "SELECT id, name FROM {{%categories}} WHERE is_active = true"
-                )->queryAll();
-                $catMap = [];
-                foreach ($existingCats as $cat) $catMap[(int)$cat['id']] = $cat['name'];
-
-                $recipe = $ai->generateImportRecipe(
-                    $sample, $existingBrands, $catMap,
-                    $staging->getBrands($taskId),
-                    $staging->getCategories($taskId),
-                );
-
-                $aiDuration = round(microtime(true) - $startPhase, 1);
-
-                if (!empty($recipe)) {
-                    $staging->setRecipe($taskId, $recipe);
-                    $this->stdout("  Brand mappings: " . count($recipe['brand_mapping'] ?? []) . "\n");
-                    $this->stdout("  Category mappings: " . count($recipe['category_mapping'] ?? []) . "\n");
-                    $this->stdout("  Data quality: " . ($recipe['insights']['data_quality'] ?? '?') . "\n");
-
-                    if (!empty($recipe['insights']['notes'])) {
-                        foreach ($recipe['insights']['notes'] as $note) {
-                            $this->stdout("    → {$note}\n", Console::FG_GREY);
-                        }
-                    }
-                } else {
-                    $this->stdout("  AI вернул пустой рецепт, используем базовые правила\n", Console::FG_YELLOW);
-                }
-
-                $staging->updateMeta($taskId, [
-                    'status' => 'analyzed',
-                    'analyzed_at' => date('Y-m-d H:i:s'),
-                    'ai_duration_sec' => $aiDuration,
+                $staging->updateStats($sessionId, [
+                    'recipe'            => $recipe,
+                    'ai_cached'         => true,
+                    'ai_recipe_version' => $cachedRecipe->recipe_version,
+                    'ai_duration_sec'   => 0,
                 ]);
-
-                $this->stdout("  Время: {$aiDuration}s\n", Console::FG_GREEN);
+                $staging->setStatus($sessionId, 'analyzed');
             } else {
-                $this->stdout("  AI недоступен, пропускаем\n", Console::FG_YELLOW);
+                $ai = Yii::$app->get('aiService');
+
+                if ($ai->isAvailable()) {
+                    $staging->setStatus($sessionId, 'analyzing');
+                    $startPhase = microtime(true);
+
+                    // Случайная выборка из PostgreSQL staging
+                    $sample = $staging->getSample($sessionId, 40);
+                    $this->stdout("  Кэш рецепта не найден, генерируем новый...\n");
+                    $this->stdout("  Сэмпл: " . count($sample) . " товаров\n");
+
+                    $existingBrands = $db->createCommand(
+                        "SELECT canonical_name FROM {{%brands}} WHERE is_active = true"
+                    )->queryColumn();
+
+                    $existingCats = $db->createCommand(
+                        "SELECT id, name FROM {{%categories}} WHERE is_active = true"
+                    )->queryAll();
+                    $catMap = [];
+                    foreach ($existingCats as $cat) $catMap[(int)$cat['id']] = $cat['name'];
+
+                    $recipe = $ai->generateImportRecipe(
+                        $sample, $existingBrands, $catMap,
+                        $uniqueBrands, $uniqueCategories,
+                    );
+
+                    $aiDuration = round(microtime(true) - $startPhase, 1);
+
+                    if (!empty($recipe)) {
+                        // Кэшируем рецепт в supplier_ai_recipes
+                        $saved = SupplierAiRecipe::saveFromAIResponse(
+                            $supplierId,
+                            $supplier,
+                            $recipe,
+                            [
+                                'sample_size'     => count($sample),
+                                'ai_model'        => 'deepseek-chat',
+                                'ai_duration_sec' => $aiDuration,
+                            ]
+                        );
+
+                        $staging->updateStats($sessionId, [
+                            'recipe'            => $recipe,
+                            'ai_cached'         => false,
+                            'ai_recipe_version' => $saved->recipe_version,
+                            'ai_duration_sec'   => $aiDuration,
+                        ]);
+
+                        $this->stdout("  Brand mappings: " . count($recipe['brand_mapping'] ?? []) . "\n");
+                        $this->stdout("  Category mappings: " . count($recipe['category_mapping'] ?? []) . "\n");
+                        $this->stdout("  Data quality: " . ($recipe['insights']['data_quality'] ?? '?') . "\n");
+                        $this->stdout("  Рецепт закэширован (v{$saved->recipe_version})\n", Console::FG_GREEN);
+
+                        if (!empty($recipe['insights']['notes'])) {
+                            foreach ($recipe['insights']['notes'] as $note) {
+                                $this->stdout("    → {$note}\n", Console::FG_GREY);
+                            }
+                        }
+                    } else {
+                        $this->stdout("  AI вернул пустой рецепт, используем базовые правила\n", Console::FG_YELLOW);
+                    }
+
+                    $staging->setStatus($sessionId, 'analyzed');
+                    $this->stdout("  Время: {$aiDuration}s\n", Console::FG_GREEN);
+                } else {
+                    $this->stdout("  AI недоступен, пропускаем\n", Console::FG_YELLOW);
+                }
             }
             $this->stdout("\n");
         }
 
-        // ═══ ФАЗА 3: НОРМАЛИЗАЦИЯ ═══
-        $this->stdout("═══ Фаза 3: Нормализация в Redis ═══\n", Console::FG_YELLOW);
-        $staging->setStatus($taskId, 'normalizing');
+        // ═══ ФАЗА 3: НОРМАЛИЗАЦИЯ в PostgreSQL staging ═══
+        $this->stdout("═══ Фаза 3: Нормализация в PostgreSQL staging ═══\n", Console::FG_YELLOW);
+        $staging->setStatus($sessionId, 'normalizing');
         $startPhase = microtime(true);
 
-        $recipe = $staging->getRecipe($taskId);
-        $normalizeJob = new \common\jobs\NormalizeStagedJob([
-            'taskId' => $taskId,
+        $normalizeJob = new NormalizeStagedJob([
+            'sessionId'    => $sessionId,
             'supplierCode' => $supplier,
+            'supplierId'   => $supplierId,
+            'recipe'       => $recipe,
         ]);
 
-        // Выполняем нормализацию синхронно (вместо очереди)
+        // Подготавливаем маппинги
         $brandMapping = $normalizeJob->buildBrandMapping($recipe);
         $categoryMapping = $normalizeJob->buildCategoryMapping($recipe);
         $nameRules = $recipe['name_rules'] ?? [];
@@ -225,114 +293,129 @@ class ImportController extends Controller
         $typeRules = $recipe['product_type_rules'] ?? [];
 
         $normalized = 0;
-        foreach ($staging->iterateProducts($taskId, 300) as $sku => $data) {
-            $data = $normalizeJob->normalizeItem($data, $brandMapping, $categoryMapping, $nameRules, $nameTemplate, $typeRules);
-            $data['_normalized'] = true;
-            $staging->stageRaw($taskId, $sku, $data);
-            $normalized++;
-            if ($normalized % 500 === 0) {
-                $this->stdout("  Normalized: {$normalized}...\r");
+        $normErrors = 0;
+        $updateBatch = [];
+
+        // Cursor-based итерация по pending записям
+        foreach ($staging->iteratePending($sessionId, 500) as $rowId => $row) {
+            try {
+                $data = $row['raw_data'];
+                $normalizedData = $normalizeJob->normalizeItem(
+                    $data, $brandMapping, $categoryMapping,
+                    $nameRules, $nameTemplate, $typeRules
+                );
+
+                $updateBatch[] = [$rowId, $normalizedData];
+                $normalized++;
+
+                // Flush batch
+                if (count($updateBatch) >= 100) {
+                    $staging->markNormalizedBatch($updateBatch);
+                    $updateBatch = [];
+                }
+
+                if ($normalized % 500 === 0) {
+                    $this->stdout("  Normalized: {$normalized}...\r");
+                }
+            } catch (\Throwable $e) {
+                $normErrors++;
+                $staging->markError($rowId, $e->getMessage());
+                if ($normErrors <= 10) {
+                    $this->stderr("  Norm error: {$e->getMessage()}\n", Console::FG_RED);
+                }
             }
         }
 
+        // Остаток
+        if (!empty($updateBatch)) {
+            $staging->markNormalizedBatch($updateBatch);
+        }
+
         $normDuration = round(microtime(true) - $startPhase, 1);
-        $this->stdout("  Normalized: {$normalized} товаров                    \n");
-        $this->stdout("  Время: {$normDuration}s\n", Console::FG_GREEN);
-        $staging->updateMeta($taskId, [
-            'status' => 'normalized',
-            'normalized_at' => date('Y-m-d H:i:s'),
+        $normRate = $normalized > 0 ? round($normalized / max($normDuration, 0.1)) : 0;
+
+        $staging->updateStats($sessionId, [
+            'normalized_items'       => $normalized,
             'normalize_duration_sec' => $normDuration,
+            'normalize_errors'       => $normErrors,
         ]);
+        $staging->setStatus($sessionId, 'normalized');
+
+        $this->stdout("  Normalized: {$normalized} товаров (ошибок: {$normErrors})      \n");
+        $this->stdout("  Скорость: {$normRate}/s, Время: {$normDuration}s\n", Console::FG_GREEN);
         $this->stdout("\n");
 
         // ═══ ФАЗА 4: ЗАПИСЬ В БД ═══
         $this->stdout("═══ Фаза 4: Bulk persist → PostgreSQL ═══\n", Console::FG_YELLOW);
 
-        $itemsInRedis = $staging->getItemCount($taskId);
-        $this->stdout("  Items in Redis: {$itemsInRedis}\n");
+        $itemsNormalized = $staging->getItemCount($sessionId, 'normalized');
+        $this->stdout("  Items in staging (normalized): {$itemsNormalized}\n");
 
+        $staging->setStatus($sessionId, 'persisting');
         $startPhase = microtime(true);
-        $db = Yii::$app->db;
 
-        // Inline persist — для синхронного режима не используем PersistStagedJob,
-        // чтобы не зависеть от Redis meta
-        $persistJob = new \common\jobs\PersistStagedJob([
-            'taskId' => $taskId,
+        $persistJob = new PersistStagedJob([
+            'sessionId'    => $sessionId,
             'supplierCode' => $supplier,
+            'supplierId'   => $supplierId,
         ]);
-        $supplierId = $db->createCommand(
-            "SELECT id FROM {{%suppliers}} WHERE code = :code",
-            [':code' => $supplier]
-        )->queryScalar();
-
-        if (!$supplierId) {
-            $this->stderr("  Поставщик '{$supplier}' не найден в БД\n", Console::FG_RED);
-            return ExitCode::DATAERR;
-        }
 
         $pStats = [
-            'cards_created' => 0,
-            'cards_updated' => 0,
+            'cards_created'  => 0,
+            'cards_updated'  => 0,
             'offers_created' => 0,
             'offers_updated' => 0,
             'variants_total' => 0,
-            'errors' => 0,
+            'errors'         => 0,
+            'persisted'      => 0,
         ];
 
-        $batchBuffer = [];
-        $batchSize = 50;
-        $persisted = 0;
+        $persistedIds = [];
 
-        foreach ($staging->iterateProducts($taskId, 300) as $sku => $data) {
+        foreach ($staging->iterateNormalized($sessionId, 500) as $rowId => $row) {
             try {
-                $dto = $staging->deserializeToDTO($data);
-                $batchBuffer[] = $dto;
+                $dto = $staging->deserializeToDTO(
+                    $row['raw_data'],
+                    $row['normalized_data']
+                );
 
-                if (count($batchBuffer) >= $batchSize) {
-                    foreach ($batchBuffer as $bDto) {
-                        try {
-                            $tx = $db->beginTransaction();
-                            $result = $persistJob->persistProduct(null, $bDto, (int)$supplierId);
-                            $tx->commit();
-                            $pStats[$result['action']]++;
-                            $pStats[$result['offer_action']]++;
-                            $pStats['variants_total'] += $result['variants'];
-                            $persisted++;
-                        } catch (\Throwable $e) {
-                            if (isset($tx) && $tx->getIsActive()) $tx->rollBack();
-                            $pStats['errors']++;
-                            if ($pStats['errors'] <= 10) {
-                                $this->stderr("  Error: {$e->getMessage()}\n", Console::FG_RED);
-                            }
-                        }
-                    }
-                    $batchBuffer = [];
-                    if ($persisted % 200 === 0) {
-                        $this->stdout("  Persist: {$persisted}/{$itemsInRedis}...\r");
-                    }
-                }
-            } catch (\Throwable $e) {
-                $pStats['errors']++;
-            }
-        }
-
-        // Остаток
-        foreach ($batchBuffer as $bDto) {
-            try {
                 $tx = $db->beginTransaction();
-                $result = $persistJob->persistProduct(null, $bDto, (int)$supplierId);
+                $result = $persistJob->persistProduct($dto, $supplierId);
                 $tx->commit();
+
                 $pStats[$result['action']]++;
                 $pStats[$result['offer_action']]++;
                 $pStats['variants_total'] += $result['variants'];
-                $persisted++;
+                $pStats['persisted']++;
+
+                $persistedIds[] = $rowId;
+
+                // Batch-обновление статуса staging
+                if (count($persistedIds) >= 100) {
+                    $staging->markPersistedBatch($persistedIds);
+                    $persistedIds = [];
+                }
+
+                if ($pStats['persisted'] % 200 === 0) {
+                    $this->stdout("  Persist: {$pStats['persisted']}/{$itemsNormalized}...\r");
+                }
+
             } catch (\Throwable $e) {
                 if (isset($tx) && $tx->getIsActive()) $tx->rollBack();
                 $pStats['errors']++;
+                $staging->markError($rowId, $e->getMessage());
+                if ($pStats['errors'] <= 10) {
+                    $this->stderr("  Error: {$e->getMessage()}\n", Console::FG_RED);
+                }
             }
         }
 
-        // Обновляем last_import_at
+        // Остаток persisted ids
+        if (!empty($persistedIds)) {
+            $staging->markPersistedBatch($persistedIds);
+        }
+
+        // Обновляем last_import_at для поставщика
         $db->createCommand()->update(
             '{{%suppliers}}',
             ['last_import_at' => new \yii\db\Expression('NOW()')],
@@ -340,29 +423,38 @@ class ImportController extends Controller
         )->execute();
 
         $persistDuration = round(microtime(true) - $startPhase, 1);
+        $persistRate = $pStats['persisted'] > 0 ? round($pStats['persisted'] / max($persistDuration, 0.1)) : 0;
 
-        $this->stdout("  Persist: {$persisted}/{$itemsInRedis} товаров                    \n");
+        $staging->updateStats($sessionId, [
+            'persisted_items'      => $pStats['persisted'],
+            'persist_duration_sec' => $persistDuration,
+            'persist_stats'        => $pStats,
+        ]);
+        $staging->setStatus($sessionId, 'completed');
+
+        $this->stdout("  Persist: {$pStats['persisted']}/{$itemsNormalized} товаров                    \n");
         $this->stdout("  Created: {$pStats['cards_created']} карточек\n");
         $this->stdout("  Updated: {$pStats['cards_updated']} карточек\n");
         $this->stdout("  Offers:  {$pStats['offers_created']} new, {$pStats['offers_updated']} updated\n");
         $this->stdout("  Variants: {$pStats['variants_total']}\n");
         $this->stdout("  Errors: {$pStats['errors']}\n");
-        $this->stdout("  Время: {$persistDuration}s\n", Console::FG_GREEN);
+        $this->stdout("  Скорость: {$persistRate}/s, Время: {$persistDuration}s\n", Console::FG_GREEN);
         $this->stdout("\n");
 
-        // Итого
-        $totalDuration = round($parseDuration + ($aiDuration ?? 0) + $normDuration + $persistDuration, 1);
+        // ═══ ИТОГО ═══
+        $totalDuration = round($parseDuration + $aiDuration + $normDuration + $persistDuration, 1);
         $this->stdout("═══════════════════════════════════════════\n", Console::FG_CYAN);
-        $this->stdout("ИТОГО: {$totalProducts} товаров → {$persisted} persisted за {$totalDuration}s\n", Console::BOLD);
-        $this->stdout("  Parse:     {$parseDuration}s\n");
-        $this->stdout("  AI:        " . ($aiDuration ?? 0) . "s\n");
-        $this->stdout("  Normalize: {$normDuration}s\n");
-        $this->stdout("  Persist:   {$persistDuration}s\n");
+        $this->stdout("ИТОГО: {$totalProducts} товаров → {$pStats['persisted']} persisted за {$totalDuration}s\n", Console::BOLD);
+        $this->stdout("  Parse:     {$parseDuration}s ({$parseRate}/s)\n");
+        $this->stdout("  AI:        {$aiDuration}s\n");
+        $this->stdout("  Normalize: {$normDuration}s ({$normRate}/s)\n");
+        $this->stdout("  Persist:   {$persistDuration}s ({$persistRate}/s)\n");
         $this->stdout("═══════════════════════════════════════════\n", Console::FG_CYAN);
 
-        // Очистка staging
-        $staging->cleanup($taskId);
-        $this->stdout("Redis staging очищен\n", Console::FG_GREY);
+        // Очистка staging (опционально)
+        $stagingTotal = $staging->getItemCount($sessionId);
+        $this->stdout("\nStaging данные ({$stagingTotal} записей) сохранены для анализа.\n", Console::FG_GREY);
+        $this->stdout("Очистить: yii import/staging-cleanup {$sessionId}\n", Console::FG_GREY);
 
         return ExitCode::OK;
     }
@@ -399,54 +491,70 @@ class ImportController extends Controller
     }
 
     /**
-     * Статус staging-задач в Redis.
+     * Статус staging-сессий в PostgreSQL.
      */
     public function actionStagingStatus(): int
     {
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
 
-        $tasks = $staging->getActiveTasks();
+        $sessions = $staging->getActiveSessions();
 
-        if (empty($tasks)) {
-            $this->stdout("Нет активных staging-задач\n", Console::FG_YELLOW);
+        if (empty($sessions)) {
+            $this->stdout("Нет активных staging-сессий\n", Console::FG_YELLOW);
             return ExitCode::OK;
         }
 
-        $this->stdout("\n=== Staging-задачи ===\n\n", Console::BOLD);
+        $this->stdout("\n=== Staging-сессии (PostgreSQL) ===\n\n", Console::BOLD);
 
-        foreach ($tasks as $task) {
-            $taskId = $task['task_id'] ?? '?';
-            $status = $task['status'] ?? '?';
-            $supplier = $task['supplier_code'] ?? '?';
-            $total = $task['total_items'] ?? 0;
-            $created = $task['created_at'] ?? '?';
+        foreach ($sessions as $s) {
+            $sessionId = $s['session_id'];
+            $status = $s['status'];
+            $supplierCode = $s['supplier_code'];
+            $totalItems = (int)$s['total_items'];
+            $stagingCount = (int)($s['staging_count'] ?? 0);
+            $createdAt = $s['created_at'];
 
             $statusColor = match ($status) {
                 'completed' => Console::FG_GREEN,
-                'failed' => Console::FG_RED,
+                'failed'    => Console::FG_RED,
                 'parsing', 'analyzing', 'normalizing', 'persisting' => Console::FG_YELLOW,
-                default => Console::FG_GREY,
+                'cleaned'   => Console::FG_GREY,
+                default     => Console::FG_CYAN,
             };
 
-            $this->stdout("  [{$taskId}]\n");
-            $this->stdout("    Поставщик: {$supplier}\n");
+            $this->stdout("  [{$sessionId}]\n");
+            $this->stdout("    Поставщик: {$supplierCode}\n");
             $this->stdout("    Статус: ", Console::BOLD);
             $this->stdout("{$status}\n", $statusColor);
-            $this->stdout("    Товаров: {$total}\n");
-            $this->stdout("    Создан: {$created}\n");
+            $this->stdout("    Товаров: {$totalItems} (в staging: {$stagingCount})\n");
+            $this->stdout("    Создан: {$createdAt}\n");
 
-            if (!empty($task['parse_duration_sec'])) {
-                $this->stdout("    Parse: {$task['parse_duration_sec']}s\n");
+            // Извлекаем stats
+            $stats = json_decode($s['stats'] ?? '{}', true) ?: [];
+            if (!empty($stats['parse_duration_sec'])) {
+                $this->stdout("    Parse: {$stats['parse_duration_sec']}s\n");
             }
-            if (!empty($task['ai_duration_sec'])) {
-                $this->stdout("    AI: {$task['ai_duration_sec']}s\n");
+            if (!empty($stats['ai_duration_sec'])) {
+                $this->stdout("    AI: {$stats['ai_duration_sec']}s\n");
             }
-            if (!empty($task['normalize_duration_sec'])) {
-                $this->stdout("    Normalize: {$task['normalize_duration_sec']}s\n");
+            if (!empty($stats['normalize_duration_sec'])) {
+                $this->stdout("    Normalize: {$stats['normalize_duration_sec']}s\n");
             }
-            if (!empty($task['persist_duration_sec'])) {
-                $this->stdout("    Persist: {$task['persist_duration_sec']}s\n");
+            if (!empty($stats['persist_duration_sec'])) {
+                $this->stdout("    Persist: {$stats['persist_duration_sec']}s\n");
+            }
+
+            // Статус-счётчики staging
+            if ($status !== 'cleaned') {
+                $statusCounts = $staging->getStatusCounts($sessionId);
+                if (!empty($statusCounts)) {
+                    $parts = [];
+                    foreach ($statusCounts as $st => $cnt) {
+                        $parts[] = "{$st}={$cnt}";
+                    }
+                    $this->stdout("    Staging: " . implode(', ', $parts) . "\n");
+                }
             }
 
             $this->stdout("\n");
@@ -456,26 +564,86 @@ class ImportController extends Controller
     }
 
     /**
-     * Очистить staging-данные задачи.
+     * Очистить staging-данные сессии.
      *
-     * @param string $taskId ID задачи
+     * @param string $sessionId ID сессии
      */
-    public function actionStagingCleanup(string $taskId): int
+    public function actionStagingCleanup(string $sessionId): int
     {
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
 
-        $meta = $staging->getMeta($taskId);
-        if (!$meta) {
-            $this->stderr("Задача не найдена: {$taskId}\n", Console::FG_RED);
+        $session = $staging->getSession($sessionId);
+        if (!$session) {
+            $this->stderr("Сессия не найдена: {$sessionId}\n", Console::FG_RED);
             return ExitCode::DATAERR;
         }
 
-        $itemCount = $staging->getItemCount($taskId);
-        $staging->cleanup($taskId);
+        $itemCount = $staging->getItemCount($sessionId);
+        $deleted = $staging->cleanupSession($sessionId);
 
-        $this->stdout("Очищено: {$taskId} ({$itemCount} товаров)\n", Console::FG_GREEN);
+        $this->stdout("Очищено: {$sessionId} ({$deleted} записей удалено)\n", Console::FG_GREEN);
 
+        return ExitCode::OK;
+    }
+
+    /**
+     * Очистить все старые staging-данные.
+     *
+     * @param int $hours Удалить сессии старше N часов (по умолчанию 48)
+     */
+    public function actionStagingCleanupOld(int $hours = 48): int
+    {
+        /** @var ImportStagingService $staging */
+        $staging = Yii::$app->get('importStaging');
+
+        $deleted = $staging->cleanupOld($hours);
+        $this->stdout("Очищено {$deleted} staging-записей старше {$hours}ч\n", Console::FG_GREEN);
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Детальная статистика конкретной сессии.
+     *
+     * @param string $sessionId ID сессии
+     */
+    public function actionSessionInfo(string $sessionId): int
+    {
+        /** @var ImportStagingService $staging */
+        $staging = Yii::$app->get('importStaging');
+
+        $info = $staging->getSessionStats($sessionId);
+        if (isset($info['error'])) {
+            $this->stderr("Ошибка: {$info['error']}\n", Console::FG_RED);
+            return ExitCode::DATAERR;
+        }
+
+        $this->stdout("\n=== Session: {$sessionId} ===\n\n", Console::BOLD);
+        $this->stdout("  Поставщик:    {$info['supplier_code']}\n");
+        $this->stdout("  Статус:       {$info['status']}\n");
+        $this->stdout("  Товаров:      {$info['total_items']}\n");
+        $this->stdout("  В staging:    {$info['staging_total']}\n");
+        $this->stdout("  Уник. бренды: {$info['unique_brands']}\n");
+        $this->stdout("  Уник. кат-ии: {$info['unique_categories']}\n");
+        $this->stdout("  Создан:       {$info['created_at']}\n");
+
+        $this->stdout("\n  Staging по статусам:\n");
+        foreach ($info['staging_counts'] as $st => $cnt) {
+            $this->stdout("    {$st}: {$cnt}\n");
+        }
+
+        $stats = $info['stats'] ?? [];
+        if (!empty($stats)) {
+            $this->stdout("\n  Статистика:\n");
+            foreach ($stats as $key => $val) {
+                if ($key === 'recipe' || $key === 'persist_stats') continue;
+                $display = is_array($val) ? json_encode($val, JSON_UNESCAPED_UNICODE) : $val;
+                $this->stdout("    {$key}: {$display}\n");
+            }
+        }
+
+        $this->stdout("\n");
         return ExitCode::OK;
     }
 
@@ -540,11 +708,15 @@ class ImportController extends Controller
         // Staging stats
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
-        $tasks = $staging->getActiveTasks();
-        if (!empty($tasks)) {
-            $this->stdout("\nStaging-задачи: " . count($tasks) . "\n", Console::BOLD);
-            foreach ($tasks as $t) {
-                $this->stdout("  {$t['task_id']} — {$t['status']} ({$t['total_items']} товаров)\n");
+        $sessions = $staging->getActiveSessions(5);
+        if (!empty($sessions)) {
+            $this->stdout("\nПоследние staging-сессии:\n", Console::BOLD);
+            foreach ($sessions as $s) {
+                $sid = $s['session_id'];
+                $status = $s['status'];
+                $total = (int)$s['total_items'];
+                $stagingCount = (int)($s['staging_count'] ?? 0);
+                $this->stdout("  {$sid} — {$status} ({$total} товаров, staging: {$stagingCount})\n");
             }
         }
 

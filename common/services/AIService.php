@@ -2,6 +2,7 @@
 
 namespace common\services;
 
+use common\enums\ProductFamily;
 use GuzzleHttp\Client as HttpClient;
 use GuzzleHttp\Exception\RequestException;
 use yii\base\Component;
@@ -204,32 +205,43 @@ PROMPT;
     // ═══════════════════════════════════════════
 
     /**
-     * Определяет категорию товара.
+     * Определяет категорию и семейство товара.
      *
      * @param string $productName Название
+     * @param string $brand Бренд
      * @param string $description Описание
-     * @param array $availableCategories [id => 'Матрасы > Пружинные', ...]
-     * @return array{category_id: int, confidence: float}
+     * @param array $availableCategories [id => 'Матрасы', ...]
+     * @return array{category_id: int, product_family: string, product_type: string, confidence: float}
      */
-    public function categorize(string $productName, string $description, array $availableCategories): array
+    public function categorize(string $productName, string $brand, string $description, array $availableCategories): array
     {
         $categoriesList = '';
         foreach ($availableCategories as $id => $path) {
             $categoriesList .= "\n  [{$id}] {$path}";
         }
 
+        $familyValues = implode(', ', array_map(
+            fn(ProductFamily $f) => "'{$f->value}'",
+            ProductFamily::concrete()
+        ));
+
         $prompt = <<<PROMPT
-Определи категорию товара из списка.
+Определи категорию и тип товара из списка.
 
 Товар: {$productName}
+Бренд: {$brand}
 Описание: {$description}
 
 Доступные категории:
 {$categoriesList}
 
+Допустимые product_family: {$familyValues}
+
 Ответь СТРОГО в JSON:
 {
   "category_id": число,
+  "product_family": "значение из списка product_family",
+  "product_type": "человекочитаемый тип (например: Матрас пружинный)",
   "confidence": 0.0-1.0
 }
 PROMPT;
@@ -243,33 +255,83 @@ PROMPT;
     // ═══════════════════════════════════════════
 
     /**
-     * Извлекает структурированные атрибуты из описания.
+     * Извлекает атрибуты со строгой типизацией по ProductFamily.
+     *
+     * Если семейство не передано — определяется автоматически из названия.
+     * AI получает жёсткую JSON-схему и обязан вернуть ответ строго по ней.
+     *
+     * @param string $productName Название товара
+     * @param string $description Описание товара
+     * @param ProductFamily|null $family Семейство товара (auto-detect если null)
+     * @return array{family: string, attributes: array, validation: array}
      */
-    public function extractAttributes(string $productName, string $description): array
-    {
-        $prompt = <<<PROMPT
-Извлеки атрибуты товара для сна из названия и описания.
+    public function extractAttributesStrict(
+        string $productName,
+        string $description,
+        ?ProductFamily $family = null
+    ): array {
+        // Автоопределение семейства
+        if ($family === null) {
+            $family = ProductFamily::detect($productName);
+        }
 
+        $schemaBlock = ProductFamilySchema::buildPromptBlock($family);
+        $jsonTemplate = json_encode(
+            ProductFamilySchema::buildJsonTemplate($family),
+            JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT
+        );
+
+        $prompt = <<<PROMPT
+Ты — эксперт по товарам для сна. Извлеки характеристики товара из названия и описания.
+
+═══ ТОВАР ═══
 Название: {$productName}
 Описание: {$description}
 
-Извлеки в JSON:
+═══ СХЕМА АТРИБУТОВ ═══
+{$schemaBlock}
+
+═══ ПРАВИЛА ═══
+1. Используй ТОЛЬКО ключи из схемы выше. НЕ добавляй свои поля.
+2. Размеры (width, length) ДОЛЖНЫ быть отдельными числами: width=160, length=200. НЕ строкой "160x200".
+3. Для enum-полей используй ТОЛЬКО допустимые значения из схемы.
+4. Если значение неизвестно — ставь null.
+5. Не выдумывай данные. Извлекай только то, что явно указано в названии или описании.
+
+═══ ФОРМАТ ОТВЕТА ═══
+Верни СТРОГО JSON:
 {
-  "height_cm": число или null,
-  "width_cm": число или null,
-  "length_cm": число или null,
-  "stiffness": "Мягкий" / "Средний" / "Жёсткий" / "Умеренно мягкий" / "Умеренно жёсткий" или null,
-  "spring_type": "Независимый" / "Зависимый" / "Без пружин" или null,
-  "max_load_kg": число или null,
-  "materials": ["материал1", "материал2"],
-  "is_orthopedic": true/false/null,
-  "is_two_sided": true/false/null,
-  "warranty_years": число или null
+  "product_family": "{$family->value}",
+  "attributes": {$jsonTemplate}
 }
 PROMPT;
 
-        $result = $this->chat($prompt, 0.1);
-        return $this->parseJsonResponse($result);
+        $result = $this->chat($prompt, 0.1, 1500);
+        $parsed = $this->parseJsonResponse($result);
+
+        // Берём атрибуты из ответа AI
+        $aiAttributes = $parsed['attributes'] ?? $parsed;
+
+        // Валидация и очистка по схеме
+        $validation = ProductFamilySchema::validate($family, $aiAttributes);
+
+        return [
+            'family'     => $family->value,
+            'attributes' => $validation['cleaned'],
+            'validation' => [
+                'valid'  => $validation['valid'],
+                'errors' => $validation['errors'],
+            ],
+        ];
+    }
+
+    /**
+     * Извлекает атрибуты (обратная совместимость — делегирует в extractAttributesStrict).
+     */
+    public function extractAttributes(string $productName, string $description): array
+    {
+        $result = $this->extractAttributesStrict($productName, $description);
+        return $result['attributes'] ?? [];
     }
 
     // ═══════════════════════════════════════════
@@ -411,6 +473,7 @@ PROMPT;
      * - правила категоризации (паттерн → категория)
      * - правила нормализации названий
      * - тип группировки вариантов
+     * - product_family для каждой категории (для привязки к JSON-схемам атрибутов)
      *
      * @param array $sampleProducts Выборка товаров (массивы, не DTO)
      * @param array $existingBrands Известные бренды в системе
@@ -428,6 +491,7 @@ PROMPT;
     ): array {
         // Формируем компактный сэмпл для промпта
         $sampleLines = '';
+        $sampleCount = 0;
         foreach (array_slice($sampleProducts, 0, 40) as $i => $p) {
             $variants = count($p['variants'] ?? []);
             $priceRange = '';
@@ -444,6 +508,7 @@ PROMPT;
                 $variants,
                 $priceRange ?: '—',
             );
+            $sampleCount = $i + 1;
         }
 
         $brandsList = implode(', ', array_slice($uniqueBrands, 0, 30));
@@ -454,11 +519,17 @@ PROMPT;
             $existingCatList .= "\n  [{$id}] {$name}";
         }
 
+        // Список допустимых product_family для AI
+        $familyValues = implode(', ', array_map(
+            fn(ProductFamily $f) => "'{$f->value}' ({$f->label()})",
+            ProductFamily::concrete()
+        ));
+
         $prompt = <<<PROMPT
 Ты — эксперт по товарам для сна (матрасы, подушки, одеяла, кровати, наматрасники, основания).
 Проанализируй выборку из прайс-листа поставщика и создай РЕЦЕПТ для автоматической нормализации ВСЕХ товаров.
 
-═══ ВЫБОРКА ТОВАРОВ ({$i} шт.) ═══
+═══ ВЫБОРКА ТОВАРОВ ({$sampleCount} шт.) ═══
 {$sampleLines}
 
 ═══ ВСЕ БРЕНДЫ В ПРАЙСЕ ═══
@@ -473,6 +544,9 @@ PROMPT;
 ═══ СУЩЕСТВУЮЩИЕ КАТЕГОРИИ В СИСТЕМЕ ═══
 {$existingCatList}
 
+═══ ДОПУСТИМЫЕ СЕМЕЙСТВА ТОВАРОВ ═══
+{$familyValues}
+
 ═══ ЗАДАЧА ═══
 Создай JSON-рецепт для автоматической обработки ВСЕГО прайса:
 
@@ -480,16 +554,17 @@ PROMPT;
    Для каждого бренда определи: это существующий (alias), новый (create) или мусор (skip).
 
 2. **category_mapping** — Маппинг категорий из прайса в существующие категории системы.
+   Для каждой категории ОБЯЗАТЕЛЬНО укажи `product_family` из списка допустимых семейств.
    Если точного совпадения нет — предложи наиболее близкую или новую.
 
-3. **name_rules** — Правила нормализации названий:
-   - Нужно ли убирать бренд из начала?
-   - Формат: "Бренд Модель" или "Модель (Бренд)"?
-   - Шаблон canonical_name
+3. **name_rules** — Правила нормализации названий.
 
-4. **product_type_rules** — Правила определения типа товара из названия/категории.
+4. **product_type_rules** — Правила определения product_family из названия/категории.
+   Используй ТОЛЬКО значения из списка допустимых семейств.
 
-5. **quality_indicators** — Какие признаки указывают на качественную карточку.
+5. **attribute_extraction_rules** — Правила извлечения размеров из названия.
+   Обрати внимание: размеры ВСЕГДА должны быть раздельно: width (число), length (число).
+   НЕ допускается формат "160x200" — только отдельные поля.
 
 Ответь СТРОГО в JSON:
 {
@@ -498,8 +573,8 @@ PROMPT;
     "New Brand": {"canonical": "New Brand", "action": "create"}
   },
   "category_mapping": {
-    "Матрасы пружинные": {"target_id": 1, "target_name": "Матрасы"},
-    "Подушки ортопедические": {"target_id": null, "target_name": "Подушки", "action": "create"}
+    "Матрасы пружинные": {"target_id": 1, "target_name": "Матрасы", "product_family": "mattress"},
+    "Подушки ортопедические": {"target_id": null, "target_name": "Подушки", "product_family": "pillow", "action": "create"}
   },
   "name_template": "{brand} {model}",
   "name_rules": {
@@ -508,13 +583,20 @@ PROMPT;
     "trim_whitespace": true
   },
   "product_type_rules": [
-    {"pattern": "матрас", "type": "mattress"},
-    {"pattern": "подушка", "type": "pillow"},
-    {"pattern": "одеяло", "type": "blanket"},
-    {"pattern": "кровать", "type": "bed"},
-    {"pattern": "наматрасник", "type": "protector"},
-    {"pattern": "основание", "type": "base"}
+    {"pattern": "матрас", "family": "mattress"},
+    {"pattern": "подушка", "family": "pillow"},
+    {"pattern": "одеяло", "family": "blanket"},
+    {"pattern": "кровать", "family": "bed"},
+    {"pattern": "наматрасник", "family": "protector"},
+    {"pattern": "основание", "family": "base"},
+    {"pattern": "топпер", "family": "topper"}
   ],
+  "attribute_extraction_rules": {
+    "size_pattern": "описание regex/правила для извлечения ширины и длины",
+    "size_in_name": true,
+    "size_separator": "х|x|*|X",
+    "notes": "заметки по специфике прайса"
+  },
   "variant_grouping": "model_name",
   "insights": {
     "total_brands": 0,
@@ -664,7 +746,15 @@ PROMPT;
                     'messages' => [
                         [
                             'role' => 'system',
-                            'content' => 'Ты — AI-ассистент агрегатора товаров для сна. Отвечай ТОЛЬКО валидным JSON без markdown-обёртки.',
+                            'content' => implode("\n", [
+                                'Ты — AI-ассистент агрегатора товаров для сна (матрасы, подушки, одеяла, кровати, основания, наматрасники).',
+                                'КРИТИЧЕСКИЕ ПРАВИЛА:',
+                                '1. Отвечай ТОЛЬКО валидным JSON. Без markdown, без ```json```, без пояснений.',
+                                '2. Размеры (width, length, height) — ВСЕГДА отдельные числа в сантиметрах. НИКОГДА строкой "160x200".',
+                                '3. Для enum-полей используй ТОЛЬКО допустимые значения из промпта.',
+                                '4. Если значение неизвестно — ставь null, НЕ выдумывай.',
+                                '5. Все строки — на русском, если не указано иное.',
+                            ]),
                         ],
                         [
                             'role' => 'user',
