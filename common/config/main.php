@@ -17,5 +17,11 @@ return [
         'authManager' => [
             'class' => \yii\rbac\DbManager::class,
         ],
+        'parserRegistry' => [
+            'class' => \common\components\parsers\ParserRegistry::class,
+            'parsers' => [
+                'ormatek' => ['class' => \common\components\parsers\OrmatekXmlParser::class],
+            ],
+        ],
     ],
 ];
