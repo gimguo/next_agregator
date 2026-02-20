@@ -11,7 +11,7 @@
         "yiisoft/yii2-symfonymailer": "~2.0.3",
         "yiisoft/yii2-queue": "~2.3",
         "yiisoft/yii2-redis": "~2.0",
-        "creocoder/yii2-flysystem": "^1.1",
+        "league/flysystem": "^3.25",
         "league/flysystem-aws-s3-v3": "^3.25",
         "intervention/image": "^3.5",
         "guzzlehttp/guzzle": "^7.8"
