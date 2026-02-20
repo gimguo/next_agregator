@@ -11,8 +11,13 @@ return [
     'id' => 'app-backend',
     'basePath' => dirname(__DIR__),
     'controllerNamespace' => 'backend\controllers',
+    'defaultRoute' => 'dashboard',
     'bootstrap' => ['log', 'queue'],
-    'modules' => [],
+    'modules' => [
+        'api' => [
+            'class' => \backend\modules\api\ApiModule::class,
+        ],
+    ],
     'components' => [
         'request' => [
             'csrfParam' => '_csrf-backend',
@@ -46,7 +51,15 @@ return [
         'urlManager' => [
             'enablePrettyUrl' => true,
             'showScriptName' => false,
-            'rules' => [],
+            'rules' => [
+                // REST API v1
+                'GET api/v1/cards' => 'api/v1/cards',
+                'GET api/v1/updated' => 'api/v1/updated',
+                'GET api/v1/brands' => 'api/v1/brands',
+                'GET api/v1/categories' => 'api/v1/categories',
+                'GET api/v1/suppliers' => 'api/v1/suppliers',
+                'GET api/v1/stats' => 'api/v1/stats',
+            ],
         ],
     ],
     'params' => $params,

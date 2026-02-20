@@ -11,6 +11,8 @@ use yii\bootstrap5\Nav;
 use yii\bootstrap5\NavBar;
 
 AppAsset::register($this);
+
+$controller = Yii::$app->controller->id;
 ?>
 <?php $this->beginPage() ?>
 <!DOCTYPE html>
@@ -19,7 +21,9 @@ AppAsset::register($this);
     <meta charset="<?= Yii::$app->charset ?>">
     <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
     <?php $this->registerCsrfMetaTags() ?>
-    <title><?= Html::encode($this->title) ?></title>
+    <title><?= Html::encode($this->title) ?> — Агрегатор</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <?php $this->head() ?>
 </head>
 <body class="d-flex flex-column h-100">
@@ -28,38 +32,62 @@ AppAsset::register($this);
 <header>
     <?php
     NavBar::begin([
-        'brandLabel' => Yii::$app->name,
-        'brandUrl' => Yii::$app->homeUrl,
+        'brandLabel' => '<span style="color:#4f8cff">&#9670;</span> Агрегатор',
+        'brandUrl' => ['/dashboard/index'],
         'options' => [
             'class' => 'navbar navbar-expand-md navbar-dark bg-dark fixed-top',
         ],
     ]);
-    $menuItems = [
-        ['label' => 'Home', 'url' => ['/site/index']],
-    ];
-    if (Yii::$app->user->isGuest) {
-        $menuItems[] = ['label' => 'Login', 'url' => ['/site/login']];
-    }     
+
+    $menuItems = [];
+    if (!Yii::$app->user->isGuest) {
+        $menuItems = [
+            [
+                'label' => 'Дашборд',
+                'url' => ['/dashboard/index'],
+                'active' => $controller === 'dashboard',
+            ],
+            [
+                'label' => 'Карточки',
+                'url' => ['/product-card/index'],
+                'active' => $controller === 'product-card',
+            ],
+            [
+                'label' => 'Поставщики',
+                'url' => ['/supplier/index'],
+                'active' => $controller === 'supplier',
+            ],
+            [
+                'label' => 'Очередь',
+                'url' => ['/queue-dashboard/index'],
+                'active' => $controller === 'queue-dashboard',
+            ],
+        ];
+    }
+
     echo Nav::widget([
         'options' => ['class' => 'navbar-nav me-auto mb-2 mb-md-0'],
         'items' => $menuItems,
     ]);
-    if (Yii::$app->user->isGuest) {
-        echo Html::tag('div',Html::a('Login',['/site/login'],['class' => ['btn btn-link login text-decoration-none']]),['class' => ['d-flex']]);
-    } else {
-        echo Html::beginForm(['/site/logout'], 'post', ['class' => 'd-flex'])
+
+    if (!Yii::$app->user->isGuest) {
+        echo Html::beginForm(['/site/logout'], 'post', ['class' => 'd-flex align-items-center'])
+            . '<span class="text-secondary me-2" style="font-size:.85rem">'
+            . Html::encode(Yii::$app->user->identity->username)
+            . '</span>'
             . Html::submitButton(
-                'Logout (' . Yii::$app->user->identity->username . ')',
-                ['class' => 'btn btn-link logout text-decoration-none']
+                'Выход',
+                ['class' => 'btn btn-sm btn-dark-outline']
             )
             . Html::endForm();
     }
+
     NavBar::end();
     ?>
 </header>
 
 <main role="main" class="flex-shrink-0">
-    <div class="container">
+    <div class="container-fluid">
         <?= Breadcrumbs::widget([
             'links' => isset($this->params['breadcrumbs']) ? $this->params['breadcrumbs'] : [],
         ]) ?>
@@ -68,10 +96,10 @@ AppAsset::register($this);
     </div>
 </main>
 
-<footer class="footer mt-auto py-3 text-muted">
-    <div class="container">
-        <p class="float-start">&copy; <?= Html::encode(Yii::$app->name) ?> <?= date('Y') ?></p>
-        <p class="float-end"><?= Yii::powered() ?></p>
+<footer class="footer mt-auto">
+    <div class="container-fluid d-flex justify-content-between">
+        <span>&copy; Агрегатор <?= date('Y') ?></span>
+        <span>v2.0 &middot; <?= Yii::$app->db->driverName ?></span>
     </div>
 </footer>
 
