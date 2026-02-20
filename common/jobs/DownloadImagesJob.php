@@ -41,13 +41,20 @@ class DownloadImagesJob extends BaseObject implements JobInterface
         $db = Yii::$app->db;
 
         // Получаем pending-картинки
-        $placeholders = implode(',', array_fill(0, count($this->cardIds), '?'));
+        $params = [];
+        $placeholders = [];
+        foreach (array_values($this->cardIds) as $i => $cid) {
+            $key = ':cid' . $i;
+            $placeholders[] = $key;
+            $params[$key] = $cid;
+        }
+        $inList = implode(',', $placeholders);
         $images = $db->createCommand(
             "SELECT id, card_id, source_url, sort_order, is_main 
              FROM {{%card_images}} 
-             WHERE card_id IN ({$placeholders}) AND status = 'pending'
+             WHERE card_id IN ({$inList}) AND status = 'pending'
              ORDER BY card_id, sort_order",
-            $this->cardIds
+            $params
         )->queryAll();
 
         if (empty($images)) {
@@ -247,7 +254,14 @@ class DownloadImagesJob extends BaseObject implements JobInterface
     {
         if (empty($cardIds)) return;
 
-        $placeholders = implode(',', array_fill(0, count($cardIds), '?'));
+        $params = [];
+        $placeholders = [];
+        foreach (array_values($cardIds) as $i => $cid) {
+            $key = ':uid' . $i;
+            $placeholders[] = $key;
+            $params[$key] = $cid;
+        }
+        $inList = implode(',', $placeholders);
         $db->createCommand("
             UPDATE {{%product_cards}} SET images_status = 
                 CASE
@@ -259,8 +273,8 @@ class DownloadImagesJob extends BaseObject implements JobInterface
                     ELSE 'pending'
                 END,
                 image_count = (SELECT COUNT(*) FROM card_images WHERE card_id = product_cards.id AND status = 'completed')
-            WHERE id IN ({$placeholders})
-        ", $cardIds)->execute();
+            WHERE id IN ({$inList})
+        ", $params)->execute();
     }
 
     protected function guessExtension(string $url): string

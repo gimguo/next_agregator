@@ -297,6 +297,39 @@ a.desc:after { border-top: solid 7px var(--text-primary); border-bottom-width: 0
     text-transform: uppercase;
 }
 
+/* ═══ Dark Form Enhancements ═══ */
+.dark-form .form-label,
+.dark-form label {
+    color: var(--text-secondary);
+    font-weight: 500;
+    font-size: .85rem;
+}
+.dark-form .form-text,
+.dark-form .hint-block {
+    color: var(--text-secondary);
+    font-size: .78rem;
+    opacity: .8;
+}
+.dark-form .form-check-input {
+    background-color: var(--bg-input);
+    border-color: var(--border);
+}
+.dark-form .form-check-input:checked {
+    background-color: var(--accent);
+    border-color: var(--accent);
+}
+.dark-form .form-check-label {
+    color: var(--text-primary);
+}
+.dark-form .invalid-feedback,
+.dark-form .help-block {
+    font-size: .8rem;
+}
+.form-select option {
+    background: var(--bg-card);
+    color: var(--text-primary);
+}
+
 /* ═══ Responsive ═══ */
 @media (max-width: 768px) {
     .stat-card .stat-value { font-size: 1.5rem; }

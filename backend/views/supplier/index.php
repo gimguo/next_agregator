@@ -15,7 +15,10 @@ $models = $dataProvider->getModels();
 
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h3 class="mb-0" style="font-weight:700">Поставщики</h3>
-        <span style="color:var(--text-secondary)"><?= count($models) ?> шт.</span>
+        <div>
+            <span style="color:var(--text-secondary)" class="me-3"><?= count($models) ?> шт.</span>
+            <?= Html::a('+ Добавить', ['/supplier/create'], ['class' => 'btn btn-sm btn-accent']) ?>
+        </div>
     </div>
 
     <div class="row g-3">

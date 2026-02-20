@@ -62,33 +62,35 @@ class ImportService extends Component
             'started_at' => microtime(true),
         ];
 
-        $batchSize = (int)($options['batch_size'] ?? 50);
+        $batchSize = (int)($options['batch_size'] ?? 100);
+        $txBatchSize = (int)($options['tx_batch_size'] ?? 50); // товаров в одной транзакции
         $totalProducts = 0;
+        $txBuffer = [];
 
         try {
             foreach ($parser->parse($filePath, $options) as $productDTO) {
-                try {
-                    $transaction = $this->db->beginTransaction();
-                    $result = $this->processProduct($productDTO, $supplierId, $options);
-                    $transaction->commit();
+                $txBuffer[] = $productDTO;
 
-                    $stats[$result['action']]++;
-                    $stats[$result['offer_action']]++;
-                    $stats['variants_total'] += $result['variants'];
-                    $totalProducts++;
+                if (count($txBuffer) >= $txBatchSize) {
+                    $this->processBatch($txBuffer, $supplierId, $options, $stats);
+                    $totalProducts += count($txBuffer);
+                    $txBuffer = [];
 
                     if ($totalProducts % $batchSize === 0 && $progressCallback) {
                         $progressCallback($totalProducts, $stats);
                     }
-                } catch (\Throwable $e) {
-                    if (isset($transaction)) {
-                        $transaction->rollBack();
-                    }
-                    $stats['errors']++;
-                    if ($stats['errors'] <= 20) {
-                        Yii::warning("Ошибка обработки товара: sku={$productDTO->supplierSku} error={$e->getMessage()}", 'import');
+
+                    // Периодическая очистка памяти
+                    if ($totalProducts % 5000 === 0) {
+                        gc_collect_cycles();
                     }
                 }
+            }
+
+            // Остаток
+            if (!empty($txBuffer)) {
+                $this->processBatch($txBuffer, $supplierId, $options, $stats);
+                $totalProducts += count($txBuffer);
             }
 
             $stats['status'] = $stats['errors'] > 0
@@ -116,6 +118,47 @@ class ImportService extends Component
         Yii::info("Импорт завершён: " . json_encode($stats, JSON_UNESCAPED_UNICODE), 'import');
 
         return $stats;
+    }
+
+    /**
+     * Обработать пачку товаров в одной транзакции.
+     */
+    protected function processBatch(array $products, int $supplierId, array $options, array &$stats): void
+    {
+        $transaction = $this->db->beginTransaction();
+        try {
+            foreach ($products as $dto) {
+                try {
+                    $result = $this->processProduct($dto, $supplierId, $options);
+                    $stats[$result['action']]++;
+                    $stats[$result['offer_action']]++;
+                    $stats['variants_total'] += $result['variants'];
+                } catch (\Throwable $e) {
+                    $stats['errors']++;
+                    if ($stats['errors'] <= 50) {
+                        Yii::warning("Ошибка обработки товара: sku={$dto->supplierSku} error={$e->getMessage()}", 'import');
+                    }
+                }
+            }
+            $transaction->commit();
+        } catch (\Throwable $e) {
+            $transaction->rollBack();
+            // При ошибке пачки — откатимся к поштучной обработке
+            Yii::warning("Batch transaction failed, fallback to single: {$e->getMessage()}", 'import');
+            foreach ($products as $dto) {
+                try {
+                    $tx = $this->db->beginTransaction();
+                    $result = $this->processProduct($dto, $supplierId, $options);
+                    $tx->commit();
+                    $stats[$result['action']]++;
+                    $stats[$result['offer_action']]++;
+                    $stats['variants_total'] += $result['variants'];
+                } catch (\Throwable $innerEx) {
+                    if (isset($tx)) $tx->rollBack();
+                    $stats['errors']++;
+                }
+            }
+        }
     }
 
     protected function processProduct(ProductDTO $dto, int $supplierId, array $options): array
@@ -411,18 +454,21 @@ class ImportService extends Component
     {
         if (empty($imageUrls)) return;
 
+        // Batch INSERT для картинок
+        $values = [];
+        $params = [];
         foreach ($imageUrls as $idx => $url) {
-            $this->db->createCommand("
-                INSERT INTO {{%card_images}} (card_id, source_url, sort_order, is_main, status)
-                VALUES (:card_id, :url, :sort, :main, 'pending')
-                ON CONFLICT (card_id, source_url) DO NOTHING
-            ", [
-                ':card_id' => $cardId,
-                ':url' => $url,
-                ':sort' => $idx,
-                ':main' => $idx === 0 ? 'true' : 'false',
-            ])->execute();
+            $values[] = "(:cid{$idx}, :url{$idx}, :sort{$idx}, :main{$idx}, 'pending')";
+            $params[":cid{$idx}"] = $cardId;
+            $params[":url{$idx}"] = $url;
+            $params[":sort{$idx}"] = $idx;
+            $params[":main{$idx}"] = $idx === 0 ? 'true' : 'false';
         }
+
+        $sql = "INSERT INTO {{%card_images}} (card_id, source_url, sort_order, is_main, status) VALUES "
+            . implode(', ', $values)
+            . " ON CONFLICT (card_id, source_url) DO NOTHING";
+        $this->db->createCommand($sql, $params)->execute();
 
         $this->db->createCommand("
             UPDATE {{%product_cards}} SET images_status = 'pending' 
