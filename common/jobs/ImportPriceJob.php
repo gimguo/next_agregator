@@ -33,15 +33,25 @@ class ImportPriceJob extends BaseObject implements JobInterface
     {
         Yii::info("ImportPriceJob: старт supplier={$this->supplierCode} file={$this->filePath}", 'queue');
 
-        $importService = new ImportService();
+        /** @var ImportService $importService */
+        $importService = Yii::$app->has('importService')
+            ? Yii::$app->get('importService')
+            : Yii::createObject(ImportService::class);
 
         $stats = $importService->run($this->supplierCode, $this->filePath, $this->options);
 
         Yii::info("ImportPriceJob: завершён — " . json_encode($stats, JSON_UNESCAPED_UNICODE), 'queue');
 
-        // Если нужно скачать картинки и есть новые/обновлённые карточки
-        if ($this->downloadImages && ($stats['cards_created'] > 0 || $stats['cards_updated'] > 0)) {
+        $hasNewCards = ($stats['cards_created'] > 0 || $stats['cards_updated'] > 0);
+
+        // Скачивание картинок
+        if ($this->downloadImages && $hasNewCards) {
             $this->enqueueImageDownload($stats);
+        }
+
+        // AI-обработка: бренды + категоризация
+        if ($hasNewCards) {
+            $this->enqueueAIProcessing();
         }
     }
 
@@ -67,5 +77,61 @@ class ImportPriceJob extends BaseObject implements JobInterface
         }
 
         Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на скачку картинок", 'queue');
+    }
+
+    /**
+     * Поставить AI-задачи: резолв брендов, категоризация, обогащение.
+     */
+    protected function enqueueAIProcessing(): void
+    {
+        $db = Yii::$app->db;
+
+        // Карточки без бренда (brand_id IS NULL)
+        $unbrandedIds = $db->createCommand("
+            SELECT id FROM {{%product_cards}}
+            WHERE brand_id IS NULL AND (brand IS NOT NULL OR manufacturer IS NOT NULL)
+            ORDER BY created_at DESC
+            LIMIT 200
+        ")->queryColumn();
+
+        if (!empty($unbrandedIds)) {
+            $chunks = array_chunk($unbrandedIds, 20);
+            foreach ($chunks as $chunk) {
+                Yii::$app->queue->push(new ResolveBrandsJob(['cardIds' => $chunk]));
+            }
+            Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на резолв брендов", 'queue');
+        }
+
+        // Карточки без категории
+        $uncategorizedIds = $db->createCommand("
+            SELECT id FROM {{%product_cards}}
+            WHERE category_id IS NULL
+            ORDER BY created_at DESC
+            LIMIT 200
+        ")->queryColumn();
+
+        if (!empty($uncategorizedIds)) {
+            $chunks = array_chunk($uncategorizedIds, 10);
+            foreach ($chunks as $chunk) {
+                Yii::$app->queue->push(new CategorizeCardsJob(['cardIds' => $chunk]));
+            }
+            Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на категоризацию", 'queue');
+        }
+
+        // Обогащение карточек с низким качеством
+        $lowQualityIds = $db->createCommand("
+            SELECT id FROM {{%product_cards}}
+            WHERE quality_score < 50
+            ORDER BY quality_score ASC, created_at DESC
+            LIMIT 50
+        ")->queryColumn();
+
+        foreach ($lowQualityIds as $cardId) {
+            Yii::$app->queue->push(new EnrichCardJob(['cardId' => (int)$cardId]));
+        }
+
+        if (!empty($lowQualityIds)) {
+            Yii::info("ImportPriceJob: поставлено " . count($lowQualityIds) . " заданий на AI-обогащение", 'queue');
+        }
     }
 }

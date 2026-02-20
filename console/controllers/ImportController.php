@@ -56,7 +56,8 @@ class ImportController extends Controller
             $options['skip_images'] = true;
         }
 
-        $service = new ImportService();
+        /** @var ImportService $service */
+        $service = Yii::$app->get('importService');
         $stats = $service->run($supplier, $file, $options, function ($count, $stats) {
             $this->stdout("  Обработано: {$count} товаров...\r");
         });
