@@ -61,5 +61,21 @@ return [
         'priceFetcher' => [
             'class' => \common\services\PriceFetcher::class,
         ],
+
+        // ═══ MDM Matching Engine (Chain of Responsibility) ═══
+        'matchingService' => [
+            'class' => \common\services\matching\MatchingService::class,
+            'logResults' => true,
+        ],
+
+        // ═══ Golden Record — пересчёт агрегатов модели/варианта ═══
+        'goldenRecord' => [
+            'class' => \common\services\GoldenRecordService::class,
+        ],
+
+        // ═══ Catalog Persister — материализация DTO → MDM каталог ═══
+        'catalogPersister' => [
+            'class' => \common\services\CatalogPersisterService::class,
+        ],
     ],
 ];

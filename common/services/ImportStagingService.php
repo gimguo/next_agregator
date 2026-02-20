@@ -63,7 +63,7 @@ class ImportStagingService extends Component
             'supplier_id'   => $supplierId,
             'supplier_code' => $supplierCode,
             'file_path'     => $filePath,
-            'options'       => json_encode($options, JSON_UNESCAPED_UNICODE),
+            'options'       => new \yii\db\JsonExpression($options),
             'status'        => 'created',
             'started_at'    => new \yii\db\Expression('NOW()'),
         ])->execute();
@@ -112,11 +112,16 @@ class ImportStagingService extends Component
     public function updateStats(string $sessionId, array $data): void
     {
         $session = $this->getSession($sessionId);
-        $currentStats = json_decode($session['stats'] ?? '{}', true) ?: [];
+        $rawStats = $session['stats'] ?? '{}';
+        if (is_string($rawStats)) {
+            $currentStats = json_decode($rawStats, true) ?: [];
+        } else {
+            $currentStats = (array)$rawStats;
+        }
         $merged = array_merge($currentStats, $data);
 
         $updates = [
-            'stats'      => json_encode($merged, JSON_UNESCAPED_UNICODE),
+            'stats'      => new \yii\db\JsonExpression($merged),
             'updated_at' => new \yii\db\Expression('NOW()'),
         ];
 
@@ -165,29 +170,42 @@ class ImportStagingService extends Component
     {
         if (empty($dtos)) return 0;
 
-        $rows = [];
+        // Используем raw SQL для корректной записи JSONB
+        $values = [];
+        $params = [];
+        $idx = 0;
+
         foreach ($dtos as $dto) {
             $serialized = $this->serializeProductDTO($dto);
             $jsonData = json_encode($serialized, JSON_UNESCAPED_UNICODE);
             $rawHash = md5($jsonData);
 
-            $rows[] = [
-                $sessionId,
-                $supplierId,
-                $dto->supplierSku,
-                $rawHash,
-                $jsonData,
-                'pending',
-            ];
+            $values[] = "(:sid{$idx}, :sup{$idx}, :sku{$idx}, :hash{$idx}, :data{$idx}::jsonb, 'pending')";
+            $params[":sid{$idx}"] = $sessionId;
+            $params[":sup{$idx}"] = $supplierId;
+            $params[":sku{$idx}"] = $dto->supplierSku;
+            $params[":hash{$idx}"] = $rawHash;
+            $params[":data{$idx}"] = $jsonData;
+
+            $idx++;
+
+            // Flush в пачках по 50 (меньше расход памяти на больших DTO)
+            if ($idx >= 50) {
+                $sql = "INSERT INTO {{%staging_raw_offers}} (import_session_id, supplier_id, supplier_sku, raw_hash, raw_data, status) VALUES " . implode(', ', $values);
+                $this->db->createCommand($sql, $params)->execute();
+                $values = [];
+                $params = [];
+                $idx = 0;
+            }
         }
 
-        $this->db->createCommand()->batchInsert(
-            '{{%staging_raw_offers}}',
-            ['import_session_id', 'supplier_id', 'supplier_sku', 'raw_hash', 'raw_data', 'status'],
-            $rows
-        )->execute();
+        // Остаток
+        if (!empty($values)) {
+            $sql = "INSERT INTO {{%staging_raw_offers}} (import_session_id, supplier_id, supplier_sku, raw_hash, raw_data, status) VALUES " . implode(', ', $values);
+            $this->db->createCommand($sql, $params)->execute();
+        }
 
-        return count($rows);
+        return count($dtos);
     }
 
     /**
@@ -198,14 +216,17 @@ class ImportStagingService extends Component
         $serialized = $this->serializeProductDTO($dto);
         $jsonData = json_encode($serialized, JSON_UNESCAPED_UNICODE);
 
-        $this->db->createCommand()->insert('{{%staging_raw_offers}}', [
-            'import_session_id' => $sessionId,
-            'supplier_id'      => $supplierId,
-            'supplier_sku'     => $dto->supplierSku,
-            'raw_hash'         => md5($jsonData),
-            'raw_data'         => $jsonData,
-            'status'           => 'pending',
-        ])->execute();
+        $this->db->createCommand(
+            "INSERT INTO {{%staging_raw_offers}} (import_session_id, supplier_id, supplier_sku, raw_hash, raw_data, status)
+             VALUES (:sid, :sup, :sku, :hash, :data::jsonb, 'pending')",
+            [
+                ':sid'  => $sessionId,
+                ':sup'  => $supplierId,
+                ':sku'  => $dto->supplierSku,
+                ':hash' => md5($jsonData),
+                ':data' => $jsonData,
+            ]
+        )->execute();
 
         return (int)$this->db->getLastInsertID('staging_raw_offers_id_seq');
     }
@@ -315,10 +336,11 @@ class ImportStagingService extends Component
      */
     public function markNormalized(int $rowId, array $normalizedData): void
     {
-        $this->db->createCommand()->update('{{%staging_raw_offers}}', [
-            'normalized_data' => json_encode($normalizedData, JSON_UNESCAPED_UNICODE),
-            'status'          => 'normalized',
-        ], ['id' => $rowId])->execute();
+        $json = json_encode($normalizedData, JSON_UNESCAPED_UNICODE);
+        $this->db->createCommand(
+            "UPDATE {{%staging_raw_offers}} SET normalized_data = :data::jsonb, status = 'normalized' WHERE id = :id",
+            [':data' => $json, ':id' => $rowId]
+        )->execute();
     }
 
     /**
@@ -334,10 +356,11 @@ class ImportStagingService extends Component
         $tx = $this->db->beginTransaction();
         try {
             foreach ($updates as [$rowId, $normalizedData]) {
-                $this->db->createCommand()->update('{{%staging_raw_offers}}', [
-                    'normalized_data' => json_encode($normalizedData, JSON_UNESCAPED_UNICODE),
-                    'status'          => 'normalized',
-                ], ['id' => $rowId])->execute();
+                $json = json_encode($normalizedData, JSON_UNESCAPED_UNICODE);
+                $this->db->createCommand(
+                    "UPDATE {{%staging_raw_offers}} SET normalized_data = :data::jsonb, status = 'normalized' WHERE id = :id",
+                    [':data' => $json, ':id' => $rowId]
+                )->execute();
             }
             $tx->commit();
         } catch (\Throwable $e) {
@@ -376,10 +399,16 @@ class ImportStagingService extends Component
     {
         if (empty($rowIds)) return;
 
-        $placeholders = implode(',', array_fill(0, count($rowIds), '?'));
+        $ids = array_values($rowIds);
+        $placeholders = implode(',', array_map(fn($i) => ':id' . $i, array_keys($ids)));
+        $params = [];
+        foreach ($ids as $i => $id) {
+            $params[':id' . $i] = $id;
+        }
+
         $this->db->createCommand(
             "UPDATE {{%staging_raw_offers}} SET status = 'persisted' WHERE id IN ({$placeholders})",
-            $rowIds
+            $params
         )->execute();
     }
 
@@ -561,8 +590,16 @@ class ImportStagingService extends Component
      *
      * Использует normalized_data если есть, иначе raw_data.
      */
-    public function deserializeToDTO(array $data, ?array $normalizedData = null): ProductDTO
+    public function deserializeToDTO(array|string $data, array|string|null $normalizedData = null): ProductDTO
     {
+        // Автоматический json_decode из PostgreSQL JSONB
+        if (is_string($data)) {
+            $data = json_decode($data, true) ?: [];
+        }
+        if (is_string($normalizedData)) {
+            $normalizedData = json_decode($normalizedData, true) ?: [];
+        }
+
         // Если есть нормализованные данные — берём canonical имена оттуда
         $canonical = $normalizedData ?: [];
 

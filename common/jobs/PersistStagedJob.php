@@ -2,6 +2,7 @@
 
 namespace common\jobs;
 
+use common\services\CatalogPersisterService;
 use common\services\ImportStagingService;
 use yii\base\BaseObject;
 use yii\queue\JobInterface;
@@ -9,15 +10,17 @@ use yii\queue\Queue;
 use Yii;
 
 /**
- * Фаза 4: Bulk-запись из PostgreSQL staging → боевые таблицы.
+ * Фаза 4: Bulk-запись из PostgreSQL staging → MDM-каталог.
  *
- * Итерирует по staging_raw_offers со статусом 'normalized',
- * десериализует в ProductDTO и записывает в product_cards + supplier_offers.
+ * Итерирует по staging_raw_offers (status='normalized'),
+ * десериализует в ProductDTO и передаёт в CatalogPersisterService,
+ * который через MatchingService → GoldenRecordService записывает
+ * в трёхуровневую иерархию: product_models → reference_variants → supplier_offers.
  *
- * Cursor-based iteration (WHERE id > :lastId), каждый товар в своей транзакции.
- * После persist — статус строки в staging меняется на 'persisted'.
+ * Cursor-based iteration, каждый товар в своей транзакции.
+ * После persist — статус строки в staging = 'persisted'.
  *
- * После завершения ставит:
+ * После завершения ставит фоновые задачи:
  * - DownloadImagesJob (картинки)
  * - AI-обогащение (бренды, категории, описания)
  */
@@ -36,6 +39,9 @@ class PersistStagedJob extends BaseObject implements JobInterface
     /** @var int Размер батча для записи в БД */
     public int $batchSize = 50;
 
+    /** @var bool Использовать ли новый MDM-каталог (product_models + reference_variants) */
+    public bool $useMdmCatalog = true;
+
     // Обратная совместимость
     public string $taskId = '';
 
@@ -49,7 +55,7 @@ class PersistStagedJob extends BaseObject implements JobInterface
 
     public function execute($queue): void
     {
-        Yii::info("PersistStagedJob: старт sessionId={$this->sessionId}", 'import');
+        Yii::info("PersistStagedJob: старт sessionId={$this->sessionId} mdm={$this->useMdmCatalog}", 'import');
 
         /** @var ImportStagingService $staging */
         $staging = Yii::$app->get('importStaging');
@@ -66,6 +72,138 @@ class PersistStagedJob extends BaseObject implements JobInterface
         $totalInStaging = $staging->getItemCount($this->sessionId, 'normalized');
         Yii::info("PersistStagedJob: items to persist = {$totalInStaging}", 'import');
 
+        if ($this->useMdmCatalog) {
+            $stats = $this->persistViaMdm($staging, $startTime, $totalInStaging);
+        } else {
+            $stats = $this->persistLegacy($staging, $startTime, $totalInStaging);
+        }
+
+        $duration = round(microtime(true) - $startTime, 1);
+        $persisted = $stats['persisted'] ?? 0;
+        $rate = $persisted > 0 ? round($persisted / max($duration, 0.1)) : 0;
+
+        // Обновляем last_import_at для поставщика
+        $db->createCommand()->update(
+            '{{%suppliers}}',
+            ['last_import_at' => new \yii\db\Expression('NOW()')],
+            ['code' => $this->supplierCode]
+        )->execute();
+
+        $staging->updateStats($this->sessionId, [
+            'persisted_items'       => $persisted,
+            'persist_duration_sec'  => $duration,
+            'persist_rate'          => $rate,
+            'persist_stats'         => $stats,
+        ]);
+        $staging->setStatus($this->sessionId, 'completed');
+
+        Yii::info("PersistStagedJob: завершён — " . json_encode($stats) . " rate={$rate}/s time={$duration}s", 'import');
+
+        // Фоновые задачи
+        $hasNewData = ($stats['models_created'] ?? $stats['cards_created'] ?? 0) > 0 ||
+                      ($stats['offers_created'] ?? 0) > 0;
+
+        if ($this->downloadImages && $hasNewData) {
+            $this->enqueueImageDownload();
+        }
+
+        if ($this->runAIEnrichment && $hasNewData) {
+            $this->enqueueAIProcessing();
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // MDM PERSIST — через CatalogPersisterService
+    // ═══════════════════════════════════════════
+
+    protected function persistViaMdm(ImportStagingService $staging, float $startTime, int $total): array
+    {
+        /** @var CatalogPersisterService $persister */
+        $persister = Yii::$app->get('catalogPersister');
+        $persister->resetStats();
+
+        $db = Yii::$app->db;
+        $persistedIds = [];
+        $persisted = 0;
+        $errors = 0;
+
+        foreach ($staging->iterateNormalized($this->sessionId, 500) as $rowId => $row) {
+            try {
+                $dto = $staging->deserializeToDTO(
+                    $row['raw_data'],
+                    $row['normalized_data']
+                );
+
+                $tx = $db->beginTransaction();
+
+                $result = $persister->persist(
+                    $dto,
+                    $this->supplierId,
+                    $this->sessionId,
+                );
+
+                $tx->commit();
+
+                $persisted++;
+                $persistedIds[] = $rowId;
+
+                // Batch-обновление статуса staging
+                if (count($persistedIds) >= 100) {
+                    $staging->markPersistedBatch($persistedIds);
+                    $persistedIds = [];
+                }
+
+                if ($persisted % 200 === 0) {
+                    $elapsed = round(microtime(true) - $startTime, 1);
+                    $rate = $persisted > 0 ? round($persisted / max($elapsed, 0.1)) : 0;
+                    $s = $persister->getStats();
+                    Yii::info(
+                        "PersistStagedJob[MDM]: прогресс {$persisted}/{$total} rate={$rate}/s " .
+                        "models_new={$s['models_created']} matched={$s['models_matched']} " .
+                        "variants_new={$s['variants_created']} matched_v={$s['variants_matched']}",
+                        'import'
+                    );
+                }
+
+                if ($persisted % 2000 === 0) {
+                    gc_collect_cycles();
+                }
+
+            } catch (\Throwable $e) {
+                if (isset($tx) && $tx->getIsActive()) {
+                    $tx->rollBack();
+                }
+                $errors++;
+                $staging->markError($rowId, $e->getMessage());
+                if ($errors <= 30) {
+                    Yii::warning(
+                        "PersistStagedJob[MDM]: ошибка row={$rowId}: {$e->getMessage()}",
+                        'import'
+                    );
+                }
+            }
+        }
+
+        // Остаток persisted ids
+        if (!empty($persistedIds)) {
+            $staging->markPersistedBatch($persistedIds);
+        }
+
+        $stats = $persister->getStats();
+        $stats['persisted'] = $persisted;
+        $stats['errors'] = $errors;
+
+        return $stats;
+    }
+
+    // ═══════════════════════════════════════════
+    // LEGACY PERSIST — прямая запись в product_cards (backward compat)
+    // ═══════════════════════════════════════════
+
+    protected function persistLegacy(ImportStagingService $staging, float $startTime, int $total): array
+    {
+        $db = Yii::$app->db;
+
         $stats = [
             'cards_created'  => 0,
             'cards_updated'  => 0,
@@ -78,113 +216,61 @@ class PersistStagedJob extends BaseObject implements JobInterface
 
         $persistedIds = [];
 
-        try {
-            foreach ($staging->iterateNormalized($this->sessionId, 500) as $rowId => $row) {
-                try {
-                    $dto = $staging->deserializeToDTO(
-                        $row['raw_data'],
-                        $row['normalized_data']
+        foreach ($staging->iterateNormalized($this->sessionId, 500) as $rowId => $row) {
+            try {
+                $dto = $staging->deserializeToDTO(
+                    $row['raw_data'],
+                    $row['normalized_data']
+                );
+
+                $tx = $db->beginTransaction();
+                $result = $this->persistProductLegacy($dto, $this->supplierId);
+                $tx->commit();
+
+                $stats[$result['action']]++;
+                $stats[$result['offer_action']]++;
+                $stats['variants_total'] += $result['variants'];
+                $stats['persisted']++;
+
+                $persistedIds[] = $rowId;
+
+                if (count($persistedIds) >= 100) {
+                    $staging->markPersistedBatch($persistedIds);
+                    $persistedIds = [];
+                }
+
+                if ($stats['persisted'] % 200 === 0) {
+                    $elapsed = round(microtime(true) - $startTime, 1);
+                    $rate = $stats['persisted'] > 0 ? round($stats['persisted'] / max($elapsed, 0.1)) : 0;
+                    Yii::info(
+                        "PersistStagedJob[legacy]: прогресс {$stats['persisted']}/{$total} rate={$rate}/s",
+                        'import'
                     );
+                }
 
-                    $tx = $db->beginTransaction();
-                    $result = $this->persistProduct($dto, $this->supplierId);
-                    $tx->commit();
-
-                    $stats[$result['action']]++;
-                    $stats[$result['offer_action']]++;
-                    $stats['variants_total'] += $result['variants'];
-                    $stats['persisted']++;
-
-                    $persistedIds[] = $rowId;
-
-                    // Batch-обновление статуса staging
-                    if (count($persistedIds) >= 100) {
-                        $staging->markPersistedBatch($persistedIds);
-                        $persistedIds = [];
-                    }
-
-                    if ($stats['persisted'] % 200 === 0) {
-                        $elapsed = round(microtime(true) - $startTime, 1);
-                        $rate = $stats['persisted'] > 0 ? round($stats['persisted'] / max($elapsed, 0.1)) : 0;
-                        Yii::info(
-                            "PersistStagedJob: прогресс persisted={$stats['persisted']}/{$totalInStaging} " .
-                            "rate={$rate}/s cards_c={$stats['cards_created']} cards_u={$stats['cards_updated']}",
-                            'import'
-                        );
-                    }
-
-                    if ($stats['persisted'] % 2000 === 0) {
-                        gc_collect_cycles();
-                    }
-
-                } catch (\Throwable $e) {
-                    if (isset($tx) && $tx->getIsActive()) {
-                        $tx->rollBack();
-                    }
-                    $stats['errors']++;
-                    $staging->markError($rowId, $e->getMessage());
-                    if ($stats['errors'] <= 30) {
-                        Yii::warning(
-                            "PersistStagedJob: ошибка row={$rowId}: {$e->getMessage()}",
-                            'import'
-                        );
-                    }
+            } catch (\Throwable $e) {
+                if (isset($tx) && $tx->getIsActive()) {
+                    $tx->rollBack();
+                }
+                $stats['errors']++;
+                $staging->markError($rowId, $e->getMessage());
+                if ($stats['errors'] <= 30) {
+                    Yii::warning("PersistStagedJob[legacy]: ошибка row={$rowId}: {$e->getMessage()}", 'import');
                 }
             }
-
-            // Остаток persisted ids
-            if (!empty($persistedIds)) {
-                $staging->markPersistedBatch($persistedIds);
-            }
-
-        } catch (\Throwable $e) {
-            Yii::error("PersistStagedJob: критическая ошибка — {$e->getMessage()}", 'import');
-            $stats['errors']++;
         }
 
-        $duration = round(microtime(true) - $startTime, 1);
-        $rate = $stats['persisted'] > 0 ? round($stats['persisted'] / max($duration, 0.1)) : 0;
-
-        // Обновляем last_import_at для поставщика
-        $db->createCommand()->update(
-            '{{%suppliers}}',
-            ['last_import_at' => new \yii\db\Expression('NOW()')],
-            ['code' => $this->supplierCode]
-        )->execute();
-
-        $staging->updateStats($this->sessionId, [
-            'persisted_items'       => $stats['persisted'],
-            'persist_duration_sec'  => $duration,
-            'persist_rate'          => $rate,
-            'persist_stats'         => $stats,
-        ]);
-        $staging->setStatus($this->sessionId, 'completed');
-
-        Yii::info(
-            "PersistStagedJob: завершён — " .
-            "created={$stats['cards_created']} updated={$stats['cards_updated']} " .
-            "offers_new={$stats['offers_created']} offers_upd={$stats['offers_updated']} " .
-            "variants={$stats['variants_total']} errors={$stats['errors']} " .
-            "rate={$rate}/s time={$duration}s",
-            'import'
-        );
-
-        // Фоновые задачи
-        $hasNewCards = ($stats['cards_created'] > 0 || $stats['cards_updated'] > 0);
-
-        if ($this->downloadImages && $hasNewCards) {
-            $this->enqueueImageDownload();
+        if (!empty($persistedIds)) {
+            $staging->markPersistedBatch($persistedIds);
         }
 
-        if ($this->runAIEnrichment && $hasNewCards) {
-            $this->enqueueAIProcessing();
-        }
+        return $stats;
     }
 
     /**
-     * Сохранить один товар в БД (карточка + оффер + картинки).
+     * Legacy: сохранить один товар в product_cards + supplier_offers.
      */
-    public function persistProduct($dto, int $supplierId): array
+    public function persistProductLegacy($dto, int $supplierId): array
     {
         $variantCount = count($dto->variants);
         $db = Yii::$app->db;
@@ -205,7 +291,7 @@ class PersistStagedJob extends BaseObject implements JobInterface
             $this->updateCard($db, (int)$cardId, $dto);
         }
 
-        $offerAction = $this->upsertOffer($db, $dto, (int)$cardId, $supplierId);
+        $offerAction = $this->upsertOfferLegacy($db, $dto, (int)$cardId, $supplierId);
 
         if (!empty($dto->imageUrls)) {
             $this->enqueueImages($db, (int)$cardId, $dto->imageUrls);
@@ -289,7 +375,7 @@ class PersistStagedJob extends BaseObject implements JobInterface
         $db->createCommand($sql, $params)->execute();
     }
 
-    public function upsertOffer($db, $dto, int $cardId, int $supplierId): string
+    public function upsertOfferLegacy($db, $dto, int $cardId, int $supplierId): string
     {
         $variantsJson = json_encode(array_map(fn($v) => [
             'sku'          => $v->sku,

@@ -74,7 +74,7 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
         // Cursor-based итерация по pending записям
         foreach ($staging->iteratePending($this->sessionId, 500) as $rowId => $row) {
             try {
-                $data = $row['raw_data'];
+                $data = is_string($row['raw_data']) ? json_decode($row['raw_data'], true) : $row['raw_data'];
                 $normalizedData = $this->normalizeItem(
                     $data, $brandMapping, $categoryMapping,
                     $nameRules, $nameTemplate, $productTypeRules

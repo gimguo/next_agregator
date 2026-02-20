@@ -7,6 +7,7 @@ use common\jobs\ImportPriceJob;
 use common\jobs\NormalizeStagedJob;
 use common\jobs\PersistStagedJob;
 use common\models\SupplierAiRecipe;
+use common\services\CatalogPersisterService;
 use common\services\ImportService;
 use common\services\ImportStagingService;
 use yii\console\Controller;
@@ -138,7 +139,7 @@ class ImportController extends Controller
         $startPhase = microtime(true);
         $totalProducts = 0;
         $batchBuffer = [];
-        $batchSize = 500;
+        $batchSize = 100;
 
         foreach ($parser->parse($file, $options) as $productDTO) {
             $batchBuffer[] = $productDTO;
@@ -299,7 +300,7 @@ class ImportController extends Controller
         // Cursor-based итерация по pending записям
         foreach ($staging->iteratePending($sessionId, 500) as $rowId => $row) {
             try {
-                $data = $row['raw_data'];
+                $data = is_string($row['raw_data']) ? json_decode($row['raw_data'], true) : $row['raw_data'];
                 $normalizedData = $normalizeJob->normalizeItem(
                     $data, $brandMapping, $categoryMapping,
                     $nameRules, $nameTemplate, $typeRules
@@ -345,8 +346,8 @@ class ImportController extends Controller
         $this->stdout("  Скорость: {$normRate}/s, Время: {$normDuration}s\n", Console::FG_GREEN);
         $this->stdout("\n");
 
-        // ═══ ФАЗА 4: ЗАПИСЬ В БД ═══
-        $this->stdout("═══ Фаза 4: Bulk persist → PostgreSQL ═══\n", Console::FG_YELLOW);
+        // ═══ ФАЗА 4: ЗАПИСЬ В MDM-КАТАЛОГ ═══
+        $this->stdout("═══ Фаза 4: Persist → MDM каталог (product_models → reference_variants → supplier_offers) ═══\n", Console::FG_YELLOW);
 
         $itemsNormalized = $staging->getItemCount($sessionId, 'normalized');
         $this->stdout("  Items in staging (normalized): {$itemsNormalized}\n");
@@ -354,22 +355,12 @@ class ImportController extends Controller
         $staging->setStatus($sessionId, 'persisting');
         $startPhase = microtime(true);
 
-        $persistJob = new PersistStagedJob([
-            'sessionId'    => $sessionId,
-            'supplierCode' => $supplier,
-            'supplierId'   => $supplierId,
-        ]);
+        /** @var CatalogPersisterService $persister */
+        $persister = Yii::$app->get('catalogPersister');
+        $persister->resetStats();
 
-        $pStats = [
-            'cards_created'  => 0,
-            'cards_updated'  => 0,
-            'offers_created' => 0,
-            'offers_updated' => 0,
-            'variants_total' => 0,
-            'errors'         => 0,
-            'persisted'      => 0,
-        ];
-
+        $persisted = 0;
+        $errors = 0;
         $persistedIds = [];
 
         foreach ($staging->iterateNormalized($sessionId, 500) as $rowId => $row) {
@@ -380,14 +371,10 @@ class ImportController extends Controller
                 );
 
                 $tx = $db->beginTransaction();
-                $result = $persistJob->persistProduct($dto, $supplierId);
+                $result = $persister->persist($dto, $supplierId, $sessionId);
                 $tx->commit();
 
-                $pStats[$result['action']]++;
-                $pStats[$result['offer_action']]++;
-                $pStats['variants_total'] += $result['variants'];
-                $pStats['persisted']++;
-
+                $persisted++;
                 $persistedIds[] = $rowId;
 
                 // Batch-обновление статуса staging
@@ -396,16 +383,20 @@ class ImportController extends Controller
                     $persistedIds = [];
                 }
 
-                if ($pStats['persisted'] % 200 === 0) {
-                    $this->stdout("  Persist: {$pStats['persisted']}/{$itemsNormalized}...\r");
+                if ($persisted % 200 === 0) {
+                    $s = $persister->getStats();
+                    $this->stdout("  Persist: {$persisted}/{$itemsNormalized} " .
+                        "(models: +{$s['models_created']} ={$s['models_matched']}, " .
+                        "variants: +{$s['variants_created']} ={$s['variants_matched']})...\r");
                 }
 
             } catch (\Throwable $e) {
                 if (isset($tx) && $tx->getIsActive()) $tx->rollBack();
-                $pStats['errors']++;
+                $errors++;
                 $staging->markError($rowId, $e->getMessage());
-                if ($pStats['errors'] <= 10) {
+                if ($errors <= 10) {
                     $this->stderr("  Error: {$e->getMessage()}\n", Console::FG_RED);
+                    $this->stderr("    File: {$e->getFile()}:{$e->getLine()}\n", Console::FG_GREY);
                 }
             }
         }
@@ -422,33 +413,50 @@ class ImportController extends Controller
             ['code' => $supplier]
         )->execute();
 
+        $pStats = $persister->getStats();
+        $pStats['persisted'] = $persisted;
+        $pStats['errors'] = $errors;
+
         $persistDuration = round(microtime(true) - $startPhase, 1);
-        $persistRate = $pStats['persisted'] > 0 ? round($pStats['persisted'] / max($persistDuration, 0.1)) : 0;
+        $persistRate = $persisted > 0 ? round($persisted / max($persistDuration, 0.1)) : 0;
 
         $staging->updateStats($sessionId, [
-            'persisted_items'      => $pStats['persisted'],
+            'persisted_items'      => $persisted,
             'persist_duration_sec' => $persistDuration,
             'persist_stats'        => $pStats,
         ]);
         $staging->setStatus($sessionId, 'completed');
 
-        $this->stdout("  Persist: {$pStats['persisted']}/{$itemsNormalized} товаров                    \n");
-        $this->stdout("  Created: {$pStats['cards_created']} карточек\n");
-        $this->stdout("  Updated: {$pStats['cards_updated']} карточек\n");
-        $this->stdout("  Offers:  {$pStats['offers_created']} new, {$pStats['offers_updated']} updated\n");
-        $this->stdout("  Variants: {$pStats['variants_total']}\n");
-        $this->stdout("  Errors: {$pStats['errors']}\n");
+        // Matching Engine статистика
+        $matchingStats = Yii::$app->get('matchingService')->getStats();
+
+        $this->stdout("  Persist: {$persisted}/{$itemsNormalized} товаров                              \n");
+        $this->stdout("\n  ┌─ MDM Models ─────────────────────────────\n");
+        $this->stdout("  │ Created: {$pStats['models_created']}\n");
+        $this->stdout("  │ Matched: {$pStats['models_matched']}\n");
+        $this->stdout("  ├─ Reference Variants ─────────────────────\n");
+        $this->stdout("  │ Created: {$pStats['variants_created']}\n");
+        $this->stdout("  │ Matched: {$pStats['variants_matched']}\n");
+        $this->stdout("  ├─ Supplier Offers ────────────────────────\n");
+        $this->stdout("  │ Created: {$pStats['offers_created']}\n");
+        $this->stdout("  │ Updated: {$pStats['offers_updated']}\n");
+        $this->stdout("  ├─ Matching Engine ────────────────────────\n");
+        foreach ($matchingStats['by_matcher'] ?? [] as $matcher => $count) {
+            $this->stdout("  │ {$matcher}: {$count}\n");
+        }
+        $this->stdout("  └─ Errors: {$errors}\n");
         $this->stdout("  Скорость: {$persistRate}/s, Время: {$persistDuration}s\n", Console::FG_GREEN);
         $this->stdout("\n");
 
         // ═══ ИТОГО ═══
         $totalDuration = round($parseDuration + $aiDuration + $normDuration + $persistDuration, 1);
         $this->stdout("═══════════════════════════════════════════\n", Console::FG_CYAN);
-        $this->stdout("ИТОГО: {$totalProducts} товаров → {$pStats['persisted']} persisted за {$totalDuration}s\n", Console::BOLD);
+        $this->stdout("ИТОГО: {$totalProducts} товаров → {$persisted} persisted за {$totalDuration}s\n", Console::BOLD);
         $this->stdout("  Parse:     {$parseDuration}s ({$parseRate}/s)\n");
         $this->stdout("  AI:        {$aiDuration}s\n");
         $this->stdout("  Normalize: {$normDuration}s ({$normRate}/s)\n");
         $this->stdout("  Persist:   {$persistDuration}s ({$persistRate}/s)\n");
+        $this->stdout("  MDM: models={$pStats['models_created']}, variants={$pStats['variants_created']}, offers={$pStats['offers_created']}\n");
         $this->stdout("═══════════════════════════════════════════\n", Console::FG_CYAN);
 
         // Очистка staging (опционально)
@@ -686,13 +694,22 @@ class ImportController extends Controller
 
         $cards = $db->createCommand("SELECT COUNT(*) FROM {{%product_cards}}")->queryScalar();
         $offers = $db->createCommand("SELECT COUNT(*) FROM {{%supplier_offers}}")->queryScalar();
+        $models = $db->createCommand("SELECT COUNT(*) FROM {{%product_models}}")->queryScalar();
+        $variants = $db->createCommand("SELECT COUNT(*) FROM {{%reference_variants}}")->queryScalar();
+        $mdmOffers = $db->createCommand("SELECT COUNT(*) FROM {{%supplier_offers}} WHERE model_id IS NOT NULL")->queryScalar();
         $images = $db->createCommand("SELECT status, COUNT(*) as cnt FROM {{%card_images}} GROUP BY status ORDER BY status")->queryAll();
         $suppliers = $db->createCommand("SELECT code, name, last_import_at FROM {{%suppliers}} WHERE is_active = true")->queryAll();
 
         $this->stdout("\n=== Статистика агрегатора ===\n\n", Console::BOLD);
 
-        $this->stdout("Карточки:         {$cards}\n");
-        $this->stdout("Предложения:      {$offers}\n\n");
+        $this->stdout("── MDM каталог ──\n", Console::FG_CYAN);
+        $this->stdout("Модели (product_models):       {$models}\n");
+        $this->stdout("Варианты (reference_variants):  {$variants}\n");
+        $this->stdout("Офферы с MDM-привязкой:         {$mdmOffers}\n\n");
+
+        $this->stdout("── Legacy каталог ──\n", Console::FG_GREY);
+        $this->stdout("Карточки (product_cards):       {$cards}\n");
+        $this->stdout("Офферы (всего):                 {$offers}\n\n");
 
         $this->stdout("Поставщики:\n", Console::BOLD);
         foreach ($suppliers as $s) {
