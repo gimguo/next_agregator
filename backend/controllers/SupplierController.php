@@ -133,6 +133,8 @@ class SupplierController extends Controller
         $filePath = Yii::$app->request->post('file_path');
         $maxProducts = (int)Yii::$app->request->post('max_products', 0);
         $downloadImages = (bool)Yii::$app->request->post('download_images', 1);
+        $importMode = Yii::$app->request->post('import_mode', 'pipeline');
+        $useAI = (bool)Yii::$app->request->post('use_ai', 1);
 
         if (empty($filePath)) {
             Yii::$app->session->setFlash('error', 'Не указан файл прайса');
@@ -149,9 +151,17 @@ class SupplierController extends Controller
             'filePath' => $filePath,
             'options' => $options,
             'downloadImages' => $downloadImages,
+            'mode' => $importMode,
+            'analyzeWithAI' => $useAI,
         ]));
 
-        Yii::$app->session->setFlash('success', "Импорт поставлен в очередь (Job #{$jobId}). Файл: " . basename($filePath) . ($maxProducts > 0 ? " (лимит: {$maxProducts})" : ''));
+        $modeLabel = $importMode === 'pipeline' ? 'Pipeline (Redis → AI → DB)' : 'Legacy (прямой)';
+        Yii::$app->session->setFlash('success',
+            "Импорт поставлен в очередь (Job #{$jobId}, {$modeLabel}). " .
+            "Файл: " . basename($filePath) .
+            ($maxProducts > 0 ? " (лимит: {$maxProducts})" : '') .
+            ($useAI ? ' + AI-анализ' : '')
+        );
 
         return $this->redirect(['/supplier/view', 'id' => $id]);
     }

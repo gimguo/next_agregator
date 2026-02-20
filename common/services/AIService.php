@@ -400,6 +400,175 @@ PROMPT;
     }
 
     // ═══════════════════════════════════════════
+    // РЕЦЕПТ ИМПОРТА (batch-анализ прайса)
+    // ═══════════════════════════════════════════
+
+    /**
+     * Генерирует «рецепт» для автоматической нормализации всего прайса.
+     *
+     * AI анализирует выборку из 30-50 товаров и возвращает:
+     * - маппинг брендов (грязное → каноническое)
+     * - правила категоризации (паттерн → категория)
+     * - правила нормализации названий
+     * - тип группировки вариантов
+     *
+     * @param array $sampleProducts Выборка товаров (массивы, не DTO)
+     * @param array $existingBrands Известные бренды в системе
+     * @param array $existingCategories Существующие категории
+     * @param array $uniqueBrands Все уникальные бренды в прайсе
+     * @param array $uniqueCategories Все уникальные категории в прайсе
+     * @return array Рецепт нормализации
+     */
+    public function generateImportRecipe(
+        array $sampleProducts,
+        array $existingBrands = [],
+        array $existingCategories = [],
+        array $uniqueBrands = [],
+        array $uniqueCategories = [],
+    ): array {
+        // Формируем компактный сэмпл для промпта
+        $sampleLines = '';
+        foreach (array_slice($sampleProducts, 0, 40) as $i => $p) {
+            $variants = count($p['variants'] ?? []);
+            $priceRange = '';
+            if (!empty($p['variants'])) {
+                $prices = array_filter(array_column($p['variants'], 'price'), fn($pr) => $pr > 0);
+                if ($prices) $priceRange = min($prices) . '–' . max($prices) . '₽';
+            }
+            $sampleLines .= sprintf(
+                "\n[%d] Бренд: %s | Модель: %s | Категория: %s | Вариантов: %d | Цена: %s",
+                $i + 1,
+                $p['manufacturer'] ?? $p['brand'] ?? '—',
+                $p['model'] ?? $p['name'] ?? '—',
+                $p['category_path'] ?? '—',
+                $variants,
+                $priceRange ?: '—',
+            );
+        }
+
+        $brandsList = implode(', ', array_slice($uniqueBrands, 0, 30));
+        $categoriesList = implode(', ', array_slice($uniqueCategories, 0, 30));
+        $existingBrandsList = implode(', ', array_slice($existingBrands, 0, 50));
+        $existingCatList = '';
+        foreach (array_slice($existingCategories, 0, 30) as $id => $name) {
+            $existingCatList .= "\n  [{$id}] {$name}";
+        }
+
+        $prompt = <<<PROMPT
+Ты — эксперт по товарам для сна (матрасы, подушки, одеяла, кровати, наматрасники, основания).
+Проанализируй выборку из прайс-листа поставщика и создай РЕЦЕПТ для автоматической нормализации ВСЕХ товаров.
+
+═══ ВЫБОРКА ТОВАРОВ ({$i} шт.) ═══
+{$sampleLines}
+
+═══ ВСЕ БРЕНДЫ В ПРАЙСЕ ═══
+{$brandsList}
+
+═══ ВСЕ КАТЕГОРИИ В ПРАЙСЕ ═══
+{$categoriesList}
+
+═══ ИЗВЕСТНЫЕ БРЕНДЫ В СИСТЕМЕ ═══
+{$existingBrandsList}
+
+═══ СУЩЕСТВУЮЩИЕ КАТЕГОРИИ В СИСТЕМЕ ═══
+{$existingCatList}
+
+═══ ЗАДАЧА ═══
+Создай JSON-рецепт для автоматической обработки ВСЕГО прайса:
+
+1. **brand_mapping** — Маппинг брендов из прайса в канонические названия.
+   Для каждого бренда определи: это существующий (alias), новый (create) или мусор (skip).
+
+2. **category_mapping** — Маппинг категорий из прайса в существующие категории системы.
+   Если точного совпадения нет — предложи наиболее близкую или новую.
+
+3. **name_rules** — Правила нормализации названий:
+   - Нужно ли убирать бренд из начала?
+   - Формат: "Бренд Модель" или "Модель (Бренд)"?
+   - Шаблон canonical_name
+
+4. **product_type_rules** — Правила определения типа товара из названия/категории.
+
+5. **quality_indicators** — Какие признаки указывают на качественную карточку.
+
+Ответь СТРОГО в JSON:
+{
+  "brand_mapping": {
+    "ОРМАТЭК": {"canonical": "Орматек", "action": "alias"},
+    "New Brand": {"canonical": "New Brand", "action": "create"}
+  },
+  "category_mapping": {
+    "Матрасы пружинные": {"target_id": 1, "target_name": "Матрасы"},
+    "Подушки ортопедические": {"target_id": null, "target_name": "Подушки", "action": "create"}
+  },
+  "name_template": "{brand} {model}",
+  "name_rules": {
+    "remove_brand_prefix": true,
+    "capitalize": true,
+    "trim_whitespace": true
+  },
+  "product_type_rules": [
+    {"pattern": "матрас", "type": "mattress"},
+    {"pattern": "подушка", "type": "pillow"},
+    {"pattern": "одеяло", "type": "blanket"},
+    {"pattern": "кровать", "type": "bed"},
+    {"pattern": "наматрасник", "type": "protector"},
+    {"pattern": "основание", "type": "base"}
+  ],
+  "variant_grouping": "model_name",
+  "insights": {
+    "total_brands": 0,
+    "total_categories": 0,
+    "data_quality": 0,
+    "notes": ["заметка1"]
+  }
+}
+PROMPT;
+
+        $result = $this->chat($prompt, 0.2, 4000);
+        return $this->parseJsonResponse($result);
+    }
+
+    /**
+     * Генерация описания товара.
+     */
+    public function generateDescription(string $productName, string $brand, string $existingDescription = ''): string
+    {
+        $prompt = <<<PROMPT
+Создай SEO-оптимизированное описание для товара для сна.
+
+Товар: {$productName}
+Бренд: {$brand}
+Существующее описание: {$existingDescription}
+
+Создай продающее описание на 2-3 абзаца (до 500 символов).
+Не выдумывай технические характеристики, если их нет в исходных данных.
+Ответь ТОЛЬКО текстом описания, без JSON и markdown.
+PROMPT;
+
+        return trim($this->chat($prompt, 0.7, 1000));
+    }
+
+    /**
+     * Анализ качества карточки (упрощённый).
+     */
+    public function analyzeQuality(array $cardData): array
+    {
+        $card = json_encode($cardData, JSON_UNESCAPED_UNICODE);
+
+        $prompt = <<<PROMPT
+Оцени качество карточки товара (0-100):
+{$card}
+
+Критерии: полнота названия, описание, атрибуты, картинки.
+Ответь JSON: {"score": число, "issues": ["проблема"]}
+PROMPT;
+
+        $result = $this->chat($prompt, 0.2, 500);
+        return $this->parseJsonResponse($result);
+    }
+
+    // ═══════════════════════════════════════════
     // НОРМАЛИЗАЦИЯ НАЗВАНИЯ
     // ═══════════════════════════════════════════
 

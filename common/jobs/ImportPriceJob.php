@@ -3,36 +3,118 @@
 namespace common\jobs;
 
 use common\services\ImportService;
+use common\services\ImportStagingService;
 use yii\base\BaseObject;
 use yii\queue\JobInterface;
 use yii\queue\Queue;
 use Yii;
 
 /**
- * Задание: импорт прайс-листа поставщика через очередь.
+ * Оркестратор импорта прайс-листа.
+ *
+ * Поддерживает два режима:
+ *
+ * 1. **PIPELINE** (новый, по умолчанию):
+ *    Parse → Redis staging → AI recipe → Normalize → Bulk persist → Background jobs
+ *    Быстрый, масштабируемый, с AI-нормализацией.
+ *
+ * 2. **LEGACY** (прямой):
+ *    Parse → ImportService → PostgreSQL (потоково, без Redis)
+ *    Простой, без дополнительных зависимостей.
  *
  * Использование:
+ *   // Pipeline (рекомендуется):
  *   Yii::$app->queue->push(new ImportPriceJob([
  *       'supplierCode' => 'ormatek',
  *       'filePath' => '/app/storage/prices/ormatek/All.xml',
- *       'options' => ['max_products' => 100],
- *       'downloadImages' => true,
+ *       'mode' => 'pipeline',
+ *   ]));
+ *
+ *   // Legacy:
+ *   Yii::$app->queue->push(new ImportPriceJob([
+ *       'supplierCode' => 'ormatek',
+ *       'filePath' => '/app/storage/prices/ormatek/All.xml',
+ *       'mode' => 'legacy',
  *   ]));
  */
 class ImportPriceJob extends BaseObject implements JobInterface
 {
+    /** @var string Код поставщика */
     public string $supplierCode;
+
+    /** @var string Путь к файлу прайса */
     public string $filePath;
+
+    /** @var array Опции парсинга */
     public array $options = [];
+
+    /** @var bool Скачивать ли картинки */
     public bool $downloadImages = true;
+
+    /** @var string Режим: 'pipeline' (Redis staging) или 'legacy' (прямой) */
+    public string $mode = 'pipeline';
+
+    /** @var bool Использовать ли AI-анализ в pipeline-режиме */
+    public bool $analyzeWithAI = true;
 
     /**
      * @param Queue $queue
      */
     public function execute($queue): void
     {
-        Yii::info("ImportPriceJob: старт supplier={$this->supplierCode} file={$this->filePath}", 'queue');
+        Yii::info(
+            "ImportPriceJob: старт mode={$this->mode} supplier={$this->supplierCode} file={$this->filePath}",
+            'queue'
+        );
 
+        if ($this->mode === 'pipeline') {
+            $this->executePipeline($queue);
+        } else {
+            $this->executeLegacy($queue);
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // PIPELINE MODE (Redis staging)
+    // ═══════════════════════════════════════════
+
+    /**
+     * Pipeline: создаёт задачу staging и ставит StagePriceJob.
+     *
+     * Дальше цепочка:
+     * StagePriceJob → AnalyzePriceJob → NormalizeStagedJob → PersistStagedJob
+     */
+    protected function executePipeline(Queue $queue): void
+    {
+        /** @var ImportStagingService $staging */
+        $staging = Yii::$app->get('importStaging');
+
+        // Создаём задачу
+        $taskId = $staging->createTask($this->supplierCode, $this->filePath, $this->options);
+
+        Yii::info("ImportPriceJob: pipeline taskId={$taskId}", 'queue');
+
+        // Ставим первую фазу в очередь
+        Yii::$app->queue->push(new StagePriceJob([
+            'supplierCode' => $this->supplierCode,
+            'filePath' => $this->filePath,
+            'taskId' => $taskId,
+            'options' => $this->options,
+            'analyzeWithAI' => $this->analyzeWithAI,
+        ]));
+
+        Yii::info("ImportPriceJob: StagePriceJob поставлен в очередь (taskId={$taskId})", 'queue');
+    }
+
+    // ═══════════════════════════════════════════
+    // LEGACY MODE (прямой ImportService)
+    // ═══════════════════════════════════════════
+
+    /**
+     * Legacy: прямой импорт через ImportService → PostgreSQL.
+     */
+    protected function executeLegacy(Queue $queue): void
+    {
         /** @var ImportService $importService */
         $importService = Yii::$app->has('importService')
             ? Yii::$app->get('importService')
@@ -40,7 +122,7 @@ class ImportPriceJob extends BaseObject implements JobInterface
 
         $stats = $importService->run($this->supplierCode, $this->filePath, $this->options);
 
-        Yii::info("ImportPriceJob: завершён — " . json_encode($stats, JSON_UNESCAPED_UNICODE), 'queue');
+        Yii::info("ImportPriceJob[legacy]: завершён — " . json_encode($stats, JSON_UNESCAPED_UNICODE), 'queue');
 
         $hasNewCards = ($stats['cards_created'] > 0 || $stats['cards_updated'] > 0);
 
@@ -49,7 +131,7 @@ class ImportPriceJob extends BaseObject implements JobInterface
             $this->enqueueImageDownload($stats);
         }
 
-        // AI-обработка: бренды + категоризация
+        // AI-обработка
         if ($hasNewCards) {
             $this->enqueueAIProcessing();
         }
@@ -57,7 +139,6 @@ class ImportPriceJob extends BaseObject implements JobInterface
 
     protected function enqueueImageDownload(array $stats): void
     {
-        // Находим карточки с pending-картинками
         $cardIds = Yii::$app->db->createCommand("
             SELECT DISTINCT card_id FROM {{%card_images}} 
             WHERE status = 'pending' 
@@ -67,7 +148,6 @@ class ImportPriceJob extends BaseObject implements JobInterface
 
         if (empty($cardIds)) return;
 
-        // Группируем по 10 карточек на задание
         $chunks = array_chunk($cardIds, 10);
         foreach ($chunks as $chunk) {
             Yii::$app->queue->push(new DownloadImagesJob([
@@ -79,14 +159,10 @@ class ImportPriceJob extends BaseObject implements JobInterface
         Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на скачку картинок", 'queue');
     }
 
-    /**
-     * Поставить AI-задачи: резолв брендов, категоризация, обогащение.
-     */
     protected function enqueueAIProcessing(): void
     {
         $db = Yii::$app->db;
 
-        // Карточки без бренда (brand_id IS NULL)
         $unbrandedIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
             WHERE brand_id IS NULL AND (brand IS NOT NULL OR manufacturer IS NOT NULL)
@@ -102,7 +178,6 @@ class ImportPriceJob extends BaseObject implements JobInterface
             Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на резолв брендов", 'queue');
         }
 
-        // Карточки без категории
         $uncategorizedIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
             WHERE category_id IS NULL
@@ -118,7 +193,6 @@ class ImportPriceJob extends BaseObject implements JobInterface
             Yii::info("ImportPriceJob: поставлено " . count($chunks) . " заданий на категоризацию", 'queue');
         }
 
-        // Обогащение карточек с низким качеством
         $lowQualityIds = $db->createCommand("
             SELECT id FROM {{%product_cards}}
             WHERE quality_score < 50

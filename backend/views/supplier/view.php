@@ -212,10 +212,14 @@ $pendingImages = Yii::$app->db->createCommand("
                                 </td>
                             </tr>
                         </table>
+                        <div class="text-end mt-2">
+                            <?= Html::a('&#9998; Настроить', ['/supplier-fetch-config/update', 'supplierId' => $supplier->id], ['class' => 'btn btn-sm btn-dark-outline']) ?>
+                        </div>
                     <?php else: ?>
-                        <div style="color:var(--text-secondary);font-size:.85rem">
+                        <div style="color:var(--text-secondary);font-size:.85rem" class="mb-2">
                             Конфигурация получения не задана
                         </div>
+                        <?= Html::a('+ Создать конфигурацию', ['/supplier-fetch-config/update', 'supplierId' => $supplier->id], ['class' => 'btn btn-sm btn-accent']) ?>
                     <?php endif; ?>
 
                     <hr style="border-color:var(--border)">

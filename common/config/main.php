@@ -50,6 +50,13 @@ return [
             'class' => \common\services\ImportService::class,
         ],
 
+        // ═══ Redis Staging для импорта ═══
+        // Быстрое хранилище для парсинга → нормализации → bulk persist
+        'importStaging' => [
+            'class' => \common\services\ImportStagingService::class,
+            'ttl' => 86400, // 24 часа
+        ],
+
         // ═══ Получение прайсов (FTP, URL, Email, API) ═══
         'priceFetcher' => [
             'class' => \common\services\PriceFetcher::class,
