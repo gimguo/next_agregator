@@ -330,6 +330,45 @@ a.desc:after { border-top: solid 7px var(--text-primary); border-bottom-width: 0
     color: var(--text-primary);
 }
 
+/* ═══ Detail View (dark) ═══ */
+.detail-view th {
+    background: rgba(0,0,0,.15);
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: .82rem;
+    width: 200px;
+    white-space: nowrap;
+    border-color: var(--border);
+}
+.detail-view td {
+    border-color: var(--border);
+}
+
+/* ═══ Stat Card Links ═══ */
+a .stat-card {
+    transition: transform .15s, box-shadow .15s;
+}
+a .stat-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(0,0,0,.3);
+}
+
+/* ═══ Badge extra statuses ═══ */
+.badge-processing { background: rgba(52,152,219,.15); color: var(--info); }
+.badge-success { background: rgba(46,204,113,.15); color: var(--success); }
+.badge-error { background: rgba(231,76,60,.15); color: var(--danger); }
+.badge-normalized { background: rgba(52,152,219,.15); color: var(--info); }
+.badge-persisted { background: rgba(46,204,113,.15); color: var(--success); }
+
+/* ═══ Summary & Pager in card footer ═══ */
+.card-footer {
+    background: transparent;
+    border-top: 1px solid var(--border);
+    padding: 10px 20px;
+    font-size: .85rem;
+    color: var(--text-secondary);
+}
+
 /* ═══ Responsive ═══ */
 @media (max-width: 768px) {
     .stat-card .stat-value { font-size: 1.5rem; }

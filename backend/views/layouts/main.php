@@ -48,6 +48,11 @@ $controller = Yii::$app->controller->id;
                 'active' => $controller === 'dashboard',
             ],
             [
+                'label' => 'MDM Каталог',
+                'url' => ['/catalog/index'],
+                'active' => $controller === 'catalog',
+            ],
+            [
                 'label' => 'Карточки',
                 'url' => ['/product-card/index'],
                 'active' => $controller === 'product-card',
@@ -56,6 +61,21 @@ $controller = Yii::$app->controller->id;
                 'label' => 'Поставщики',
                 'url' => ['/supplier/index'],
                 'active' => $controller === 'supplier',
+            ],
+            [
+                'label' => 'Медиа (S3)',
+                'url' => ['/media-ui/index'],
+                'active' => $controller === 'media-ui',
+            ],
+            [
+                'label' => 'Outbox',
+                'url' => ['/outbox-ui/index'],
+                'active' => $controller === 'outbox-ui',
+            ],
+            [
+                'label' => 'Staging',
+                'url' => ['/staging-ui/index'],
+                'active' => $controller === 'staging-ui',
             ],
             [
                 'label' => 'Очередь',
