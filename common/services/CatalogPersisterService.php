@@ -42,6 +42,9 @@ class CatalogPersisterService extends Component
     /** @var OutboxService */
     private OutboxService $outbox;
 
+    /** @var MediaProcessingService */
+    private MediaProcessingService $mediaService;
+
     /** @var array Статистика текущей сессии */
     private array $stats = [
         'models_created'   => 0,
@@ -60,6 +63,7 @@ class CatalogPersisterService extends Component
         $this->matcher = Yii::$app->get('matchingService');
         $this->goldenRecord = Yii::$app->get('goldenRecord');
         $this->outbox = Yii::$app->get('outbox');
+        $this->mediaService = Yii::$app->get('mediaService');
     }
 
     /**
@@ -183,6 +187,12 @@ class CatalogPersisterService extends Component
             } else {
                 $this->outbox->offerUpdated($modelId, $variantId, $offerId, $sessionId);
             }
+        }
+
+        // ═══ MEDIA ASSETS — регистрация изображений для скачивания ═══
+        if (!empty($dto->imageUrls)) {
+            // Привязываем к модели (дедупликация: URL уже зарегистрированные — пропускаются)
+            $this->mediaService->registerImages('model', $modelId, $dto->imageUrls);
         }
 
         return [

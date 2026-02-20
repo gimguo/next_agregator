@@ -218,8 +218,9 @@ class RosMatrasSyndicationService extends Component
             ];
         }
 
-        // Изображения: собираем уникальные из всех офферов + канонические
-        $images = $this->collectImages($canonicalImages, $allOffers);
+        // ═══ 6b. ИЗОБРАЖЕНИЯ ═══
+        // Приоритет: DAM-обработанные (WebP) → сырые из офферов/канонических
+        $images = $this->collectImagesFromDAM($modelId, $canonicalImages, $allOffers);
 
         // ═══ ИТОГОВАЯ ПРОЕКЦИЯ ═══
         return [
@@ -380,9 +381,38 @@ class RosMatrasSyndicationService extends Component
     }
 
     /**
-     * Собрать уникальные изображения из канонических и офферов.
+     * Собрать изображения с приоритетом из DAM (media_assets).
+     *
+     * Приоритет:
+     *   1. Обработанные media_assets (WebP, готовые для витрины)
+     *   2. Сырые URL из canonical_images / offers (fallback, пока DAM не обработал)
      */
-    protected function collectImages(array $canonicalImages, array $allOffers): array
+    protected function collectImagesFromDAM(int $modelId, array $canonicalImages, array $allOffers): array
+    {
+        // Пытаемся получить обработанные из DAM
+        try {
+            /** @var MediaProcessingService $media */
+            $media = Yii::$app->get('mediaService');
+            $damImages = $media->getProcessedImages('model', $modelId);
+
+            if (!empty($damImages)) {
+                // DAM обработал — возвращаем готовые S3-URL (WebP)
+                return $damImages;
+            }
+        } catch (\Throwable $e) {
+            // Если mediaService не настроен — fallback
+            Yii::debug("RosMatrasSyndication: mediaService unavailable: {$e->getMessage()}", 'syndication');
+        }
+
+        // Fallback: собираем сырые URL (старая логика)
+        return $this->collectRawImages($canonicalImages, $allOffers);
+    }
+
+    /**
+     * Собрать уникальные изображения из канонических и офферов (сырые URL).
+     * Используется как fallback, пока DAM не обработал изображения.
+     */
+    protected function collectRawImages(array $canonicalImages, array $allOffers): array
     {
         $seen = [];
         $images = [];

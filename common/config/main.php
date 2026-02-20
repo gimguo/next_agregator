@@ -94,5 +94,13 @@ return [
             'class' => \common\services\marketplace\LogMarketplaceClient::class,
             'simulateErrors' => false,
         ],
+
+        // ═══ DAM — Digital Asset Management (S3/MinIO медиа-пайплайн) ═══
+        'mediaService' => [
+            'class' => \common\services\MediaProcessingService::class,
+            'webpQuality'  => 85,
+            'maxDimension' => 1600,
+            'thumbSize'    => 300,
+        ],
     ],
 ];

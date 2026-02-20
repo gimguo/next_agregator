@@ -35,4 +35,15 @@ return [
         'apiUrl' => '', // Задаётся в params-local.php
         'apiKey' => '', // Задаётся в params-local.php
     ],
+
+    // ═══ S3 / MinIO ═══
+    's3' => [
+        'endpoint'  => getenv('S3_ENDPOINT') ?: 'http://minio:9000',
+        'bucket'    => getenv('S3_BUCKET') ?: 'media',
+        'key'       => getenv('S3_KEY') ?: 'minioadmin',
+        'secret'    => getenv('S3_SECRET') ?: 'minioadmin',
+        'region'    => getenv('S3_REGION') ?: 'us-east-1',
+        'usePathStyle' => (bool)(getenv('S3_USE_PATH_STYLE') ?: true),
+        'publicUrl' => getenv('S3_PUBLIC_URL') ?: 'http://localhost:9002/media',
+    ],
 ];

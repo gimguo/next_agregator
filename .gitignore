@@ -70,5 +70,9 @@ phpunit.phar
 !/storage/prices/.gitkeep
 !/storage/logs/.gitkeep
 
+# uploaded media (stored in S3/MinIO, not in git)
+/backend/web/uploads/media/*
+!/backend/web/uploads/media/.gitkeep
+
 # docker volumes data (not needed in repo)
 docker/postgres/data

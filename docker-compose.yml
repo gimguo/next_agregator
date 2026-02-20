@@ -108,6 +108,26 @@ services:
     networks:
       - agregator
 
+  minio:
+    image: minio/minio:latest
+    container_name: agregator-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9002:9000"   # S3 API (host:9002 → container:9000)
+      - "9003:9001"   # MinIO Console (host:9003 → container:9001)
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - agregator
+
   adminer:
     image: adminer
     container_name: agregator-adminer
@@ -127,6 +147,8 @@ volumes:
   redis_data:
     driver: local
   image_storage:
+    driver: local
+  minio_data:
     driver: local
 
 networks:
