@@ -30,10 +30,10 @@ return [
         'maxConcurrentImages' => 5,
     ],
 
-    // ═══ RosMatras API (для синхронизации) ═══
+    // ═══ RosMatras API (для синхронизации витрины) ═══
     'rosmatras' => [
-        'apiUrl' => '', // Задаётся в params-local.php
-        'apiKey' => '', // Задаётся в params-local.php
+        'apiUrl'   => getenv('ROSMATRAS_API_URL') ?: 'http://host.docker.internal/api/v1',
+        'apiToken' => getenv('ROSMATRAS_API_TOKEN') ?: '',
     ],
 
     // ═══ S3 / MinIO ═══

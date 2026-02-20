@@ -5,42 +5,49 @@ namespace console\controllers;
 use common\services\OutboxService;
 use common\services\RosMatrasSyndicationService;
 use common\services\marketplace\MarketplaceApiClientInterface;
+use common\services\marketplace\MarketplaceUnavailableException;
 use yii\console\Controller;
 use yii\console\ExitCode;
 use yii\helpers\Console;
 use Yii;
 
 /**
- * Экспорт данных на витрину (Syndication Worker).
+ * Экспорт данных на витрину RosMatras (Syndication Worker).
  *
  * Обрабатывает очередь marketplace_outbox:
  *   1. Забирает pending-события (SELECT FOR UPDATE SKIP LOCKED)
- *   2. Группирует по model_id (чтобы не гонять одну модель 5 раз)
- *   3. Для каждой уникальной модели строит полную проекцию
- *   4. Отправляет через MarketplaceApiClientInterface
+ *   2. Группирует по model_id
+ *   3. Строит проекцию через RosMatrasSyndicationService
+ *   4. Отправляет через RosMatrasApiClient
  *   5. Помечает success / error
  *
- * Запуск:
+ * Устойчивость к сбоям:
+ *   - MarketplaceUnavailableException → rollback записей в pending, экспоненциальная задержка
+ *   - Обычные ошибки данных → error (не ретраить автоматически)
+ *   - Daemon режим с graceful shutdown при недоступности API
+ *
+ * Команды:
  *   php yii export/process-outbox          # Одна итерация
- *   php yii export/process-outbox --batch=200  # Больший батч
- *   php yii export/daemon                  # Бесконечный цикл (для крона/systemd)
+ *   php yii export/daemon                  # Бесконечный цикл
+ *   php yii export/sync-model --model=123  # Принудительная синхронизация модели
+ *   php yii export/ping                    # Health-check API RosMatras
  *   php yii export/status                  # Статистика очереди
- *   php yii export/retry-errors            # Повторить ошибки
+ *   php yii export/retry-errors            # Retry с exponential backoff
  *   php yii export/preview --model=123     # Предпросмотр проекции
  */
 class ExportController extends Controller
 {
-    /** @var int Размер батча (сколько outbox-записей забирать за раз) */
+    /** @var int Размер батча */
     public int $batch = 100;
 
-    /** @var int ID модели для предпросмотра */
+    /** @var int ID модели (для preview/sync-model) */
     public int $model = 0;
 
-    /** @var int Интервал между итерациями daemon (секунды) */
+    /** @var int Интервал daemon (секунды) */
     public int $interval = 10;
 
     /** @var int Максимальное кол-во ретраев */
-    public int $maxRetries = 3;
+    public int $maxRetries = 5;
 
     /** @var OutboxService */
     private OutboxService $outbox;
@@ -81,9 +88,8 @@ class ExportController extends Controller
     /**
      * Обработать очередь outbox (одна итерация).
      *
-     * Использование:
-     *   php yii export/process-outbox
-     *   php yii export/process-outbox --batch=200
+     * При MarketplaceUnavailableException — записи возвращаются в pending,
+     * команда завершается с ненулевым exit-кодом.
      */
     public function actionProcessOutbox(): int
     {
@@ -108,7 +114,7 @@ class ExportController extends Controller
 
         $successModels = 0;
         $errorModels = 0;
-        $totalOutboxIds = [];
+        $skippedModels = 0;
 
         // 2. Для каждой уникальной модели — строим проекцию и отправляем
         foreach ($grouped as $modelId => $events) {
@@ -116,23 +122,22 @@ class ExportController extends Controller
             $eventTypes = array_unique(array_column($events, 'event_type'));
 
             $this->stdout("  [model_id={$modelId}] ", Console::FG_CYAN);
-            $this->stdout(count($events) . " событий (" . implode(', ', $eventTypes) . ") ", Console::FG_GREY);
+            $this->stdout(count($events) . " событий (" . implode(', ', $eventTypes) . ") ");
 
             try {
                 // Строим проекцию
                 $projection = $this->syndicator->buildProductProjection($modelId);
 
                 if (!$projection) {
-                    // Модель не найдена или неактивна — помечаем success (нечего отправлять)
                     $this->outbox->markSuccess($outboxIds);
+                    $skippedModels++;
                     $this->stdout("→ SKIP (модель не найдена)\n", Console::FG_YELLOW);
-                    $totalOutboxIds = array_merge($totalOutboxIds, $outboxIds);
                     continue;
                 }
 
-                // Добавляем контекст событий в проекцию
+                // Добавляем контекст событий
                 $projection['_outbox_events'] = array_map(fn($e) => [
-                    'event_type' => $e['event_type'],
+                    'event_type'  => $e['event_type'],
                     'entity_type' => $e['entity_type'],
                 ], $events);
 
@@ -143,23 +148,44 @@ class ExportController extends Controller
                     $this->outbox->markSuccess($outboxIds);
                     $successModels++;
                     $this->stdout("→ OK", Console::FG_GREEN);
-                    $this->stdout(" ({$projection['name']}, {$projection['variant_count']} вариантов, " .
-                        ($projection['best_price'] ? number_format($projection['best_price'], 0, '.', ' ') . '₽' : 'N/A') . ")\n");
+                    $this->stdout(" ({$projection['name']}, " .
+                        "{$projection['variant_count']} вар., " .
+                        ($projection['best_price'] ? number_format($projection['best_price'], 0, '.', ' ') . '₽' : 'N/A') .
+                        ")\n");
                 } else {
                     $this->outbox->markError($outboxIds, 'pushProduct returned false');
                     $errorModels++;
-                    $this->stdout("→ ERROR (client returned false)\n", Console::FG_RED);
+                    $this->stdout("→ ERROR (returned false)\n", Console::FG_RED);
                 }
 
-                $totalOutboxIds = array_merge($totalOutboxIds, $outboxIds);
+            } catch (MarketplaceUnavailableException $e) {
+                // ═══ КРИТИЧНО: API недоступен ═══
+                // Возвращаем ВСЕ оставшиеся записи (включая текущие) обратно в pending
+                $this->rollbackToPending($outboxIds);
+
+                // Возвращаем оставшиеся необработанные модели
+                $this->rollbackRemainingModels($grouped, $modelId);
+
+                $this->stdout("→ API UNAVAILABLE\n", Console::FG_RED);
+                $this->stdout("\n  ⚠ API RosMatras недоступен: {$e->getMessage()}\n", Console::FG_RED);
+                $this->stdout("  → Все незавершённые записи возвращены в pending.\n", Console::FG_YELLOW);
+                $this->stdout("  → Worker завершает работу. Следующая попытка через cron.\n\n", Console::FG_YELLOW);
+
+                Yii::error(
+                    "Export worker: API unavailable, rolling back. Error: {$e->getMessage()}",
+                    'marketplace.export'
+                );
+
+                return ExitCode::TEMPFAIL;
 
             } catch (\Throwable $e) {
-                $this->outbox->markError($outboxIds, $e->getMessage());
+                // Ошибка данных — помечаем error и продолжаем с остальными
+                $this->outbox->markError($outboxIds, mb_substr($e->getMessage(), 0, 500));
                 $errorModels++;
-                $totalOutboxIds = array_merge($totalOutboxIds, $outboxIds);
-                $this->stdout("→ ERROR: " . $e->getMessage() . "\n", Console::FG_RED);
+                $this->stdout("→ ERROR: {$e->getMessage()}\n", Console::FG_RED);
+
                 Yii::error(
-                    "Export error for model_id={$modelId}: " . $e->getMessage(),
+                    "Export error model_id={$modelId}: {$e->getMessage()}",
                     'marketplace.export'
                 );
             }
@@ -171,22 +197,24 @@ class ExportController extends Controller
         $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
         $this->stdout("║   РЕЗУЛЬТАТ ЭКСПОРТА                     ║\n", Console::FG_CYAN);
         $this->stdout("╠══════════════════════════════════════════╣\n", Console::FG_CYAN);
-        $this->stdout("║ Моделей обработано:  " . str_pad($modelCount, 19) . "║\n");
-        $this->stdout("║ Событий обработано:  " . str_pad(count($totalOutboxIds), 19) . "║\n");
-        $this->stdout("║ Успешно:             " . str_pad($successModels, 19) . "║\n", Console::FG_GREEN);
-        $this->stdout("║ Ошибки:              " . str_pad($errorModels, 19) . "║\n", $errorModels > 0 ? Console::FG_RED : Console::FG_GREEN);
-        $this->stdout("║ Время:               " . str_pad($duration . 's', 19) . "║\n");
+        $this->stdout("║ Моделей:    " . str_pad($modelCount, 28) . "║\n");
+        $this->stdout("║ Успешно:    " . str_pad($successModels, 28) . "║\n", Console::FG_GREEN);
+        $this->stdout("║ Пропущено:  " . str_pad($skippedModels, 28) . "║\n");
+        $this->stdout("║ Ошибки:     " . str_pad($errorModels, 28) . "║\n",
+            $errorModels > 0 ? Console::FG_RED : Console::FG_GREEN);
+        $this->stdout("║ Время:      " . str_pad($duration . 's', 28) . "║\n");
         $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
 
         return $errorModels > 0 ? ExitCode::UNSPECIFIED_ERROR : ExitCode::OK;
     }
 
     /**
-     * Бесконечный цикл обработки outbox (daemon mode).
+     * Daemon-режим: бесконечный цикл обработки outbox.
      *
-     * Использование:
-     *   php yii export/daemon
-     *   php yii export/daemon --interval=30 --batch=200
+     * При MarketplaceUnavailableException:
+     *   - Все записи возвращаются в pending
+     *   - Экспоненциальная задержка перед следующей попыткой
+     *   - Daemon продолжает работать (не умирает)
      */
     public function actionDaemon(): int
     {
@@ -194,6 +222,8 @@ class ExportController extends Controller
         $this->stdout("  Press Ctrl+C to stop.\n\n");
 
         $iteration = 0;
+        $consecutiveApiFailures = 0;
+
         while (true) {
             $iteration++;
             $startTime = microtime(true);
@@ -206,13 +236,14 @@ class ExportController extends Controller
                 $modelCount = count($grouped);
 
                 $this->stdout(
-                    "  [" . date('H:i:s') . "] Iteration #{$iteration}: " .
+                    "  [" . date('H:i:s') . "] #{$iteration}: " .
                     "{$eventCount} events, {$modelCount} models",
                     Console::FG_YELLOW
                 );
 
                 $success = 0;
                 $errors = 0;
+                $apiDown = false;
 
                 foreach ($grouped as $modelId => $events) {
                     $outboxIds = array_column($events, 'id');
@@ -234,27 +265,206 @@ class ExportController extends Controller
                             $this->outbox->markError($outboxIds, 'pushProduct returned false');
                             $errors++;
                         }
+
+                    } catch (MarketplaceUnavailableException $e) {
+                        // API упал — rollback всех оставшихся и backoff
+                        $this->rollbackToPending($outboxIds);
+                        $this->rollbackRemainingModels($grouped, $modelId);
+                        $apiDown = true;
+                        $consecutiveApiFailures++;
+
+                        Yii::error(
+                            "Daemon: API unavailable (failure #{$consecutiveApiFailures}): {$e->getMessage()}",
+                            'marketplace.export'
+                        );
+                        break;
+
                     } catch (\Throwable $e) {
-                        $this->outbox->markError($outboxIds, $e->getMessage());
+                        $this->outbox->markError($outboxIds, mb_substr($e->getMessage(), 0, 500));
                         $errors++;
                     }
                 }
 
                 $duration = round(microtime(true) - $startTime, 2);
-                $this->stdout(" → OK:{$success} ERR:{$errors} ({$duration}s)\n",
-                    $errors > 0 ? Console::FG_RED : Console::FG_GREEN
+
+                if ($apiDown) {
+                    // Экспоненциальная задержка
+                    $backoffDelay = MarketplaceUnavailableException::calculateBackoff(
+                        $consecutiveApiFailures, 10, 600
+                    );
+
+                    $this->stdout(
+                        " → API DOWN (fail #{$consecutiveApiFailures}), backoff {$backoffDelay}s\n",
+                        Console::FG_RED
+                    );
+
+                    sleep($backoffDelay);
+                    continue;
+                }
+
+                // API работает — сбрасываем счётчик неудач
+                $consecutiveApiFailures = 0;
+
+                $this->stdout(
+                    " → OK:{$success} ERR:{$errors} ({$duration}s)\n",
+                    $errors > 0 ? Console::FG_YELLOW : Console::FG_GREEN
                 );
             } else {
-                // Тишина — не спамим в лог
-                if ($iteration % 6 === 0) { // Каждую минуту (при interval=10)
+                // Тишина
+                if ($iteration % 6 === 0) {
                     $this->stdout(
                         "  [" . date('H:i:s') . "] Idle, queue empty.\n",
                         Console::FG_GREY
                     );
                 }
+                // Если были failures — постепенно сбрасываем
+                if ($consecutiveApiFailures > 0) {
+                    $consecutiveApiFailures = max(0, $consecutiveApiFailures - 1);
+                }
             }
 
             sleep($this->interval);
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // E2E TESTING / ОТЛАДКА
+    // ═══════════════════════════════════════════
+
+    /**
+     * Принудительная синхронизация одной модели (мимо Outbox).
+     *
+     * Использование:
+     *   php yii export/sync-model --model=123
+     *
+     * Строит проекцию и отправляет напрямую через RosMatrasApiClient.
+     * Полезно для отладки одной карточки.
+     */
+    public function actionSyncModel(): int
+    {
+        if (!$this->model) {
+            $this->stderr("  ✗ Укажите --model=ID\n\n", Console::FG_RED);
+            return ExitCode::USAGE;
+        }
+
+        $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
+        $this->stdout("║   SYNC MODEL (E2E Test)                  ║\n", Console::FG_CYAN);
+        $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
+
+        // 1. Проверяем доступность API
+        $this->stdout("  1. Health check API... ", Console::FG_CYAN);
+        try {
+            $healthy = $this->client->healthCheck();
+            if ($healthy) {
+                $this->stdout("OK ✓\n", Console::FG_GREEN);
+            } else {
+                $this->stdout("WARN (health returned false, продолжаем...)\n", Console::FG_YELLOW);
+            }
+        } catch (\Throwable $e) {
+            $this->stdout("FAIL ✗\n", Console::FG_RED);
+            $this->stdout("     Ошибка: {$e->getMessage()}\n", Console::FG_RED);
+            $this->stdout("     Продолжаем всё равно...\n\n", Console::FG_YELLOW);
+        }
+
+        // 2. Строим проекцию
+        $this->stdout("  2. Строим проекцию model_id={$this->model}... ", Console::FG_CYAN);
+
+        $projection = $this->syndicator->buildProductProjection($this->model);
+
+        if (!$projection) {
+            $this->stderr("FAIL — модель не найдена или неактивна.\n\n", Console::FG_RED);
+            return ExitCode::DATAERR;
+        }
+
+        $this->stdout("OK ✓\n", Console::FG_GREEN);
+        $this->stdout("     Название: {$projection['name']}\n");
+        $this->stdout("     Вариантов: {$projection['variant_count']}\n");
+        $this->stdout("     Цена: " . ($projection['best_price']
+                ? number_format($projection['best_price'], 0, '.', ' ') . '₽'
+                : 'N/A') . "\n");
+        $this->stdout("     Изображений: " . count($projection['images']) . "\n");
+        $this->stdout("     Размер JSON: " . $this->formatBytes(strlen(json_encode($projection))) . "\n\n");
+
+        // 3. Отправляем
+        $this->stdout("  3. Отправляем на витрину... ", Console::FG_CYAN);
+
+        $startTime = microtime(true);
+
+        try {
+            $result = $this->client->pushProduct($this->model, $projection);
+            $duration = round((microtime(true) - $startTime) * 1000);
+
+            if ($result) {
+                $this->stdout("OK ✓ ({$duration}ms)\n\n", Console::FG_GREEN);
+                $this->stdout("  ═══ СИНХРОНИЗАЦИЯ УСПЕШНА ═══\n\n", Console::FG_GREEN);
+                return ExitCode::OK;
+            } else {
+                $this->stdout("FAIL — клиент вернул false.\n\n", Console::FG_RED);
+                return ExitCode::UNSPECIFIED_ERROR;
+            }
+
+        } catch (MarketplaceUnavailableException $e) {
+            $duration = round((microtime(true) - $startTime) * 1000);
+            $this->stdout("API UNAVAILABLE ({$duration}ms)\n", Console::FG_RED);
+            $this->stdout("     HTTP: " . ($e->getHttpCode() ?? 'N/A') . "\n", Console::FG_RED);
+            $this->stdout("     Ошибка: {$e->getMessage()}\n\n", Console::FG_RED);
+            return ExitCode::TEMPFAIL;
+
+        } catch (\Throwable $e) {
+            $duration = round((microtime(true) - $startTime) * 1000);
+            $this->stdout("ERROR ({$duration}ms)\n", Console::FG_RED);
+            $this->stdout("     Ошибка: {$e->getMessage()}\n\n", Console::FG_RED);
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
+    }
+
+    /**
+     * Проверить доступность API RosMatras.
+     *
+     * Использование:
+     *   php yii export/ping
+     */
+    public function actionPing(): int
+    {
+        $this->stdout("\n  Проверяем API RosMatras...\n\n", Console::FG_CYAN);
+
+        // Показываем конфигурацию
+        $params = Yii::$app->params['rosmatras'] ?? [];
+        $apiUrl = $params['apiUrl'] ?? 'не задан';
+        $hasToken = !empty($params['apiToken']);
+
+        $this->stdout("  URL:   {$apiUrl}\n");
+        $this->stdout("  Token: " . ($hasToken ? '✓ (установлен)' : '✗ (не установлен)') . "\n\n",
+            $hasToken ? Console::FG_GREEN : Console::FG_YELLOW);
+
+        if (empty($params['apiUrl'])) {
+            $this->stderr("  ✗ API URL не настроен. Задайте ROSMATRAS_API_URL в .env\n\n", Console::FG_RED);
+            return ExitCode::CONFIG;
+        }
+
+        // Health check
+        $this->stdout("  Health check... ", Console::FG_CYAN);
+        $startTime = microtime(true);
+
+        try {
+            $healthy = $this->client->healthCheck();
+            $duration = round((microtime(true) - $startTime) * 1000);
+
+            if ($healthy) {
+                $this->stdout("OK ✓ ({$duration}ms)\n\n", Console::FG_GREEN);
+                $this->stdout("  ═══ API RosMatras ДОСТУПЕН ═══\n\n", Console::FG_GREEN);
+                return ExitCode::OK;
+            } else {
+                $this->stdout("WARN ({$duration}ms) — health вернул false\n\n", Console::FG_YELLOW);
+                return ExitCode::UNSPECIFIED_ERROR;
+            }
+
+        } catch (\Throwable $e) {
+            $duration = round((microtime(true) - $startTime) * 1000);
+            $this->stdout("FAIL ✗ ({$duration}ms)\n", Console::FG_RED);
+            $this->stdout("  Ошибка: {$e->getMessage()}\n\n", Console::FG_RED);
+            $this->stdout("  ═══ API RosMatras НЕДОСТУПЕН ═══\n\n", Console::FG_RED);
+            return ExitCode::UNAVAILABLE;
         }
     }
 
@@ -264,9 +474,6 @@ class ExportController extends Controller
 
     /**
      * Показать статистику Outbox.
-     *
-     * Использование:
-     *   php yii export/status
      */
     public function actionStatus(): int
     {
@@ -311,36 +518,95 @@ class ExportController extends Controller
             SELECT COUNT(DISTINCT model_id) FROM {{%marketplace_outbox}} WHERE status = 'pending'
         ")->queryScalar();
 
-        $this->stdout("  Уникальных моделей в pending: {$pendingModels}\n\n");
+        $this->stdout("  Уникальных моделей в pending: {$pendingModels}\n");
+
+        // Error-записи с retry_count
+        $errorStats = $db->createCommand("
+            SELECT retry_count, COUNT(*) as cnt
+            FROM {{%marketplace_outbox}}
+            WHERE status = 'error'
+            GROUP BY retry_count ORDER BY retry_count
+        ")->queryAll();
+
+        if (!empty($errorStats)) {
+            $this->stdout("\n  Error-записи по кол-ву попыток:\n", Console::FG_RED);
+            foreach ($errorStats as $row) {
+                $this->stdout("    retry_count={$row['retry_count']}: {$row['cnt']}\n");
+            }
+        }
+
+        $this->stdout("\n");
 
         return ExitCode::OK;
     }
 
     /**
-     * Повторить обработку error-записей.
+     * Повторить error-записи с экспоненциальной задержкой.
      *
-     * Использование:
-     *   php yii export/retry-errors
-     *   php yii export/retry-errors --maxRetries=5
+     * Записи с большим retry_count будут ждать дольше:
+     *   retry_count=1 → сразу в pending
+     *   retry_count=2 → только если прошло 5 минут
+     *   retry_count=3 → только если прошло 20 минут
+     *   retry_count=4 → только если прошло 1 час
+     *   retry_count>=5 → не ретраить (dead letter)
      */
     public function actionRetryErrors(): int
     {
-        $retried = $this->outbox->retryErrors($this->maxRetries);
+        $this->stdout("\n  Retry error-записей (maxRetries={$this->maxRetries})...\n\n", Console::FG_CYAN);
 
-        if ($retried > 0) {
-            $this->stdout("  ✓ Вернули {$retried} записей в pending для повторной обработки.\n\n", Console::FG_GREEN);
-        } else {
-            $this->stdout("  ✓ Нет записей для повторной обработки (или все исчерпали лимит ретраев).\n\n", Console::FG_YELLOW);
+        $db = Yii::$app->db;
+
+        // Retry с учётом exponential backoff по retry_count
+        $totalRetried = 0;
+
+        // Разные уровни: чем больше retry_count, тем старше должна быть запись
+        $levels = [
+            1 => '0 minutes',    // retry_count=1: сразу
+            2 => '5 minutes',    // retry_count=2: ждём 5 мин
+            3 => '20 minutes',   // retry_count=3: ждём 20 мин
+            4 => '60 minutes',   // retry_count=4: ждём 1 час
+        ];
+
+        foreach ($levels as $retryCount => $interval) {
+            if ($retryCount > $this->maxRetries) break;
+
+            $retried = $db->createCommand("
+                UPDATE {{%marketplace_outbox}}
+                SET status = 'pending', error_log = NULL
+                WHERE status = 'error'
+                  AND retry_count = :rc
+                  AND processed_at < NOW() - INTERVAL '{$interval}'
+            ", [':rc' => $retryCount])->execute();
+
+            if ($retried > 0) {
+                $this->stdout("  retry_count={$retryCount} (ожидание {$interval}): {$retried} записей → pending\n",
+                    Console::FG_GREEN);
+                $totalRetried += $retried;
+            }
         }
 
+        // Dead letters — показать, сколько не ретраим
+        $deadLetters = $db->createCommand("
+            SELECT COUNT(*) FROM {{%marketplace_outbox}}
+            WHERE status = 'error' AND retry_count >= :max
+        ", [':max' => $this->maxRetries])->queryScalar();
+
+        if ($totalRetried > 0) {
+            $this->stdout("\n  ✓ Итого возвращено в pending: {$totalRetried}\n", Console::FG_GREEN);
+        } else {
+            $this->stdout("  Нет записей для retry (или ещё не прошло достаточно времени).\n", Console::FG_YELLOW);
+        }
+
+        if ($deadLetters > 0) {
+            $this->stdout("  ⚠ Dead letters (retry_count >= {$this->maxRetries}): {$deadLetters}\n", Console::FG_RED);
+        }
+
+        $this->stdout("\n");
         return ExitCode::OK;
     }
 
     /**
      * Предпросмотр проекции модели (не отправляет на витрину).
-     *
-     * Использование:
-     *   php yii export/preview --model=123
      */
     public function actionPreview(): int
     {
@@ -396,17 +662,15 @@ class ExportController extends Controller
         }
 
         // Полный JSON
-        $this->stdout("\n  Полный JSON ({$this->formatBytes(strlen(json_encode($projection)))}): \n\n", Console::FG_GREY);
-        $this->stdout(json_encode($projection, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT) . "\n\n");
+        $jsonStr = json_encode($projection, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+        $this->stdout("\n  Полный JSON ({$this->formatBytes(strlen($jsonStr))}): \n\n", Console::FG_GREY);
+        $this->stdout($jsonStr . "\n\n");
 
         return ExitCode::OK;
     }
 
     /**
      * Очистить старые success-записи из outbox.
-     *
-     * Использование:
-     *   php yii export/cleanup
      */
     public function actionCleanup(): int
     {
@@ -417,9 +681,6 @@ class ExportController extends Controller
 
     /**
      * Сбросить stuck processing записи (если Worker упал).
-     *
-     * Использование:
-     *   php yii export/reset-stuck
      */
     public function actionResetStuck(): int
     {
@@ -439,6 +700,65 @@ class ExportController extends Controller
         }
 
         return ExitCode::OK;
+    }
+
+    // ═══════════════════════════════════════════
+    // PRIVATE: Устойчивость к сбоям
+    // ═══════════════════════════════════════════
+
+    /**
+     * Вернуть outbox-записи обратно в pending.
+     *
+     * Используется при MarketplaceUnavailableException — не теряем данные.
+     *
+     * @param int[] $outboxIds
+     */
+    private function rollbackToPending(array $outboxIds): void
+    {
+        if (empty($outboxIds)) return;
+
+        $ids = array_values($outboxIds);
+        $placeholders = implode(',', array_map(fn($i) => ':id' . $i, array_keys($ids)));
+        $params = [];
+        foreach ($ids as $i => $id) {
+            $params[':id' . $i] = $id;
+        }
+
+        Yii::$app->db->createCommand(
+            "UPDATE {{%marketplace_outbox}} SET status = 'pending' WHERE id IN ({$placeholders})",
+            $params
+        )->execute();
+    }
+
+    /**
+     * Вернуть оставшиеся (необработанные) модели из текущего батча в pending.
+     *
+     * @param array<int, array> $grouped   Все модели текущего батча
+     * @param int               $failedModelId  ID модели, на которой случился сбой
+     */
+    private function rollbackRemainingModels(array $grouped, int $failedModelId): void
+    {
+        $allRemainingIds = [];
+        $found = false;
+
+        foreach ($grouped as $modelId => $events) {
+            if ($modelId === $failedModelId) {
+                $found = true;
+                continue; // Текущая модель уже обработана в вызывающем коде
+            }
+            if ($found) {
+                // Все модели ПОСЛЕ failedModelId — ещё не обработаны
+                $allRemainingIds = array_merge($allRemainingIds, array_column($events, 'id'));
+            }
+        }
+
+        if (!empty($allRemainingIds)) {
+            $this->rollbackToPending($allRemainingIds);
+            Yii::info(
+                "Rolled back " . count($allRemainingIds) . " outbox records to pending",
+                'marketplace.export'
+            );
+        }
     }
 
     // ═══════════════════════════════════════════

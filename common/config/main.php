@@ -89,10 +89,10 @@ return [
             'class' => \common\services\RosMatrasSyndicationService::class,
         ],
 
-        // ═══ Marketplace API Client (мок — пишет в лог) ═══
+        // ═══ Marketplace API Client (RosMatras HTTP) ═══
         'marketplaceClient' => [
-            'class' => \common\services\marketplace\LogMarketplaceClient::class,
-            'simulateErrors' => false,
+            'class' => \common\services\marketplace\RosMatrasApiClient::class,
+            // apiUrl и apiToken подтягиваются из params['rosmatras'] в init()
         ],
 
         // ═══ DAM — Digital Asset Management (S3/MinIO медиа-пайплайн) ═══

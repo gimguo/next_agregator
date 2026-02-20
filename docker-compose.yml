@@ -16,6 +16,8 @@ services:
     env_file: .env
     environment:
       - PHP_IDE_CONFIG=serverName=agregator
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - agregator
 
@@ -49,6 +51,8 @@ services:
         condition: service_healthy
     env_file: .env
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - agregator
 
