@@ -18,7 +18,17 @@ $this->params['breadcrumbs'][] = "#{$model->id}";
 
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h3 class="mb-0" style="font-weight:700"><?= Html::encode($model->name) ?></h3>
-        <div>
+        <div class="d-flex align-items-center gap-2">
+            <?= Html::beginForm(['catalog/sync', 'id' => $model->id], 'post', ['style' => 'display:inline']) ?>
+                <?= Html::submitButton(
+                    '<i class="fas fa-sync-alt"></i> Отправить на витрину',
+                    [
+                        'class' => 'btn btn-success btn-sm',
+                        'title' => 'Принудительная синхронизация на РосМатрас (мимо Outbox)',
+                        'data-confirm' => 'Отправить товар на витрину РосМатрас?',
+                    ]
+                ) ?>
+            <?= Html::endForm() ?>
             <span class="badge-status badge-<?= $model->status === 'active' ? 'active' : 'draft' ?> me-2">
                 <?= Html::encode($model->status) ?>
             </span>

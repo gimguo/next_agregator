@@ -78,7 +78,7 @@ class MediaProcessingService extends Component
     /**
      * Получить Flysystem Filesystem с S3-адаптером.
      */
-    protected function getFilesystem(): Filesystem
+    public function getFilesystem(): Filesystem
     {
         if ($this->fs === null) {
             $params = Yii::$app->params['s3'] ?? [];
@@ -147,21 +147,26 @@ class MediaProcessingService extends Component
 
             $sourceUrlHash = md5($url);
 
-            try {
-                $db->createCommand()->insert('{{%media_assets}}', [
-                    'entity_type'     => $entityType,
-                    'entity_id'       => $entityId,
-                    'source_url'      => $url,
-                    'source_url_hash' => $sourceUrlHash,
-                    'status'          => 'pending',
-                    'is_primary'      => ($sortOrder === 0),
-                    'sort_order'      => $sortOrder,
-                ])->execute();
+            // Используем INSERT ... ON CONFLICT DO NOTHING вместо try/catch,
+            // чтобы не ломать PostgreSQL-транзакцию при дубликатах.
+            // Уникальный индекс: (entity_type, entity_id, source_url_hash)
+            $affected = $db->createCommand("
+                INSERT INTO {{%media_assets}} (entity_type, entity_id, source_url, source_url_hash, status, is_primary, sort_order)
+                VALUES (:entity_type, :entity_id, :source_url, :source_url_hash, 'pending', :is_primary, :sort_order)
+                ON CONFLICT (entity_type, entity_id, source_url_hash) DO NOTHING
+            ", [
+                ':entity_type'     => $entityType,
+                ':entity_id'       => $entityId,
+                ':source_url'      => $url,
+                ':source_url_hash' => $sourceUrlHash,
+                ':is_primary'      => ($sortOrder === 0) ? 1 : 0,
+                ':sort_order'      => $sortOrder,
+            ])->execute();
 
+            if ($affected > 0) {
                 $inserted++;
                 $this->stats['registered']++;
-            } catch (\yii\db\IntegrityException $e) {
-                // Дубль по source_url_hash — уже зарегистрирован, пропускаем
+            } else {
                 $this->stats['skipped']++;
             }
         }

@@ -37,6 +37,8 @@ class RosMatrasSyndicationService extends Component
         $db = Yii::$app->db;
 
         // ═══ 1. МОДЕЛЬ ═══
+        // Загружаем модель ЛЮБОГО статуса (не только active),
+        // чтобы можно было отправить is_active=false для деактивированных моделей.
         $model = $db->createCommand("
             SELECT
                 pm.id,
@@ -68,7 +70,7 @@ class RosMatrasSyndicationService extends Component
             FROM {{%product_models}} pm
             LEFT JOIN {{%brands}} b ON b.id = pm.brand_id
             LEFT JOIN {{%categories}} c ON c.id = pm.category_id
-            WHERE pm.id = :id AND pm.status = 'active'
+            WHERE pm.id = :id
         ", [':id' => $modelId])->queryOne();
 
         if (!$model) {
@@ -194,6 +196,10 @@ class RosMatrasSyndicationService extends Component
 
             $variantOffers = array_filter($allOffers, fn($o) => (int)$o['variant_id'] === $varId);
 
+            // Вариант активен, если есть хотя бы один активный оффер с наличием
+            $activeOffers = array_filter($variantOffers, fn($o) => (bool)$o['in_stock']);
+            $variantIsActive = !empty($activeOffers) && (bool)$variant['is_in_stock'];
+
             $projectedVariants[] = [
                 'id'               => $varId,
                 'label'            => $variant['variant_label'] ?: 'Основной',
@@ -205,6 +211,7 @@ class RosMatrasSyndicationService extends Component
                 'price_range_max'  => $variant['price_range_max'] ? (float)$variant['price_range_max'] : null,
                 'compare_price'    => $bestOffer ? ($bestOffer['compare_price'] ? (float)$bestOffer['compare_price'] : null) : null,
                 'is_in_stock'      => (bool)$variant['is_in_stock'],
+                'is_active'        => $variantIsActive,
                 'supplier_count'   => (int)$variant['supplier_count'],
                 'offers'           => array_values(array_map(fn($o) => [
                     'offer_id'       => (int)$o['offer_id'],
@@ -221,6 +228,11 @@ class RosMatrasSyndicationService extends Component
         // ═══ 6b. ИЗОБРАЖЕНИЯ ═══
         // Приоритет: DAM-обработанные (WebP) → сырые из офферов/канонических
         $images = $this->collectImagesFromDAM($modelId, $canonicalImages, $allOffers);
+
+        // ═══ is_active: модель активна, если статус active И есть хотя бы один активный вариант ═══
+        $modelIsActive = $model['status'] === 'active'
+            && !empty($projectedVariants)
+            && !empty(array_filter($projectedVariants, fn($v) => $v['is_active']));
 
         // ═══ ИТОГОВАЯ ПРОЕКЦИЯ ═══
         return [
@@ -259,6 +271,7 @@ class RosMatrasSyndicationService extends Component
             'price_range_max'   => $model['price_range_max'] ? (float)$model['price_range_max'] : null,
 
             // Доступность
+            'is_active'         => $modelIsActive,
             'is_in_stock'       => (bool)$model['is_in_stock'],
             'variant_count'     => (int)$model['variant_count'],
             'offer_count'       => (int)$model['offer_count'],

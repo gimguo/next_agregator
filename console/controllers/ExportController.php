@@ -29,6 +29,7 @@ use Yii;
  * Команды:
  *   php yii export/process-outbox          # Одна итерация
  *   php yii export/daemon                  # Бесконечный цикл
+ *   php yii export/push-all                # Полная синхронизация (Initial Seed)
  *   php yii export/sync-model --model=123  # Принудительная синхронизация модели
  *   php yii export/ping                    # Health-check API RosMatras
  *   php yii export/status                  # Статистика очереди
@@ -325,6 +326,233 @@ class ExportController extends Controller
 
             sleep($this->interval);
         }
+    }
+
+    // ═══════════════════════════════════════════
+    // FULL SYNC / INITIAL SEED
+    // ═══════════════════════════════════════════
+
+    /**
+     * Полная синхронизация ВСЕХ активных моделей на витрину (Initial Seed / Mass Push).
+     *
+     * Логика:
+     *   1. Забирает все active product_models из БД батчами по 100 (экономия памяти)
+     *   2. Для каждого батча строит проекции через RosMatrasSyndicationService
+     *   3. Группирует по 50 и отправляет через RosMatrasApiClient::pushBatch()
+     *   4. Выводит красивый прогресс-бар
+     *
+     * Использование:
+     *   php yii export/push-all                   # Все активные модели
+     *   php yii export/push-all --batch=50        # Размер батча DB-запроса
+     *
+     * Сценарии:
+     *   - Initial Seed: пустая витрина → заливаем весь эталонный каталог
+     *   - Re-sync: после обновления схемы проекции
+     *   - Recovery: после потери данных на витрине
+     */
+    public function actionPushAll(): int
+    {
+        $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
+        $this->stdout("║   FULL SYNC: Все модели → РосМатрас      ║\n", Console::FG_CYAN);
+        $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
+
+        // 1. Проверяем доступность API
+        $this->stdout("  1. Health check API... ", Console::FG_CYAN);
+        try {
+            $healthy = $this->client->healthCheck();
+            if (!$healthy) {
+                $this->stderr("FAIL — API не прошёл health check.\n\n", Console::FG_RED);
+                return ExitCode::UNAVAILABLE;
+            }
+            $this->stdout("OK ✓\n\n", Console::FG_GREEN);
+        } catch (\Throwable $e) {
+            $this->stderr("FAIL ✗ ({$e->getMessage()})\n", Console::FG_RED);
+            $this->stderr("  API недоступен. Сначала убедитесь, что витрина запущена.\n\n", Console::FG_RED);
+            return ExitCode::UNAVAILABLE;
+        }
+
+        // 2. Считаем общее кол-во моделей
+        $db = Yii::$app->db;
+        $totalModels = (int)$db->createCommand(
+            "SELECT COUNT(*) FROM {{%product_models}} WHERE status = 'active'"
+        )->queryScalar();
+
+        if ($totalModels === 0) {
+            $this->stdout("  ✓ Нет активных моделей для синхронизации.\n\n", Console::FG_YELLOW);
+            return ExitCode::OK;
+        }
+
+        $this->stdout("  2. Найдено моделей: {$totalModels}\n\n", Console::FG_YELLOW);
+
+        // 3. Настройки
+        $dbBatchSize = $this->batch;    // Размер батча для DB-запроса (по умолчанию 100)
+        $pushBatchSize = 50;            // Размер батча для API pushBatch
+
+        $startTime = microtime(true);
+        $processed = 0;
+        $successCount = 0;
+        $errorCount = 0;
+        $skippedCount = 0;
+        $apiFailures = 0;
+
+        // 4. Начинаем прогресс-бар
+        Console::startProgress(0, $totalModels, '  Синхронизация: ', 60);
+
+        // 5. Основной цикл — батчи из БД
+        $offset = 0;
+
+        while (true) {
+            $modelRows = $db->createCommand("
+                SELECT id FROM {{%product_models}}
+                WHERE status = 'active'
+                ORDER BY id ASC
+                LIMIT :limit OFFSET :offset
+            ", [':limit' => $dbBatchSize, ':offset' => $offset])->queryColumn();
+
+            if (empty($modelRows)) {
+                break; // Все модели обработаны
+            }
+
+            $offset += count($modelRows);
+
+            // Строим проекции для текущего DB-батча
+            $projections = [];
+            foreach ($modelRows as $modelId) {
+                try {
+                    $projection = $this->syndicator->buildProductProjection((int)$modelId);
+
+                    if ($projection) {
+                        $projections[(int)$modelId] = $projection;
+                    } else {
+                        $skippedCount++;
+                    }
+                } catch (\Throwable $e) {
+                    $errorCount++;
+                    Yii::error(
+                        "PushAll: projection error model_id={$modelId}: {$e->getMessage()}",
+                        'marketplace.export'
+                    );
+                }
+
+                $processed++;
+                Console::updateProgress($processed, $totalModels);
+
+                // Отправляем, когда накопили pushBatchSize проекций
+                if (count($projections) >= $pushBatchSize) {
+                    $pushResult = $this->pushBatchSafe($projections, $apiFailures);
+                    $successCount += $pushResult['success'];
+                    $errorCount += $pushResult['errors'];
+                    $apiFailures = $pushResult['apiFailures'];
+                    $projections = [];
+
+                    // Если API упал 3 раза подряд — прерываем
+                    if ($apiFailures >= 3) {
+                        Console::endProgress("ABORTED\n");
+                        $this->stderr("\n  ⚠ API недоступен (3 последовательных ошибки). Прерываем.\n", Console::FG_RED);
+                        $this->printPushAllReport($totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
+                        return ExitCode::TEMPFAIL;
+                    }
+                }
+            }
+
+            // Отправляем остаток проекций после DB-батча
+            if (!empty($projections)) {
+                $pushResult = $this->pushBatchSafe($projections, $apiFailures);
+                $successCount += $pushResult['success'];
+                $errorCount += $pushResult['errors'];
+                $apiFailures = $pushResult['apiFailures'];
+
+                if ($apiFailures >= 3) {
+                    Console::endProgress("ABORTED\n");
+                    $this->stderr("\n  ⚠ API недоступен (3 последовательных ошибки). Прерываем.\n", Console::FG_RED);
+                    $this->printPushAllReport($totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
+                    return ExitCode::TEMPFAIL;
+                }
+            }
+
+            // Освобождаем память
+            gc_collect_cycles();
+        }
+
+        Console::endProgress("OK ✓\n");
+
+        // 6. Итоговый отчёт
+        $this->printPushAllReport($totalModels, $processed, $successCount, $errorCount, $skippedCount, $startTime);
+
+        return $errorCount > 0 ? ExitCode::UNSPECIFIED_ERROR : ExitCode::OK;
+    }
+
+    /**
+     * Безопасная отправка батча проекций через API.
+     * При MarketplaceUnavailableException — подождёт и увеличит счётчик ошибок.
+     */
+    private function pushBatchSafe(array $projections, int $apiFailures): array
+    {
+        $success = 0;
+        $errors = 0;
+
+        try {
+            $results = $this->client->pushBatch($projections);
+
+            foreach ($results as $modelId => $ok) {
+                if ($ok) {
+                    $success++;
+                } else {
+                    $errors++;
+                }
+            }
+
+            // Успешный запрос — сбрасываем счётчик неудач
+            $apiFailures = 0;
+
+        } catch (MarketplaceUnavailableException $e) {
+            $apiFailures++;
+            $errors += count($projections);
+
+            // Ждём с экспоненциальной задержкой
+            $backoff = MarketplaceUnavailableException::calculateBackoff($apiFailures, 5, 60);
+            Yii::warning(
+                "PushAll: API unavailable (fail #{$apiFailures}), backoff {$backoff}s: {$e->getMessage()}",
+                'marketplace.export'
+            );
+            sleep($backoff);
+
+        } catch (\Throwable $e) {
+            $errors += count($projections);
+            Yii::error(
+                "PushAll: batch error: {$e->getMessage()}",
+                'marketplace.export'
+            );
+        }
+
+        return [
+            'success' => $success,
+            'errors' => $errors,
+            'apiFailures' => $apiFailures,
+        ];
+    }
+
+    /**
+     * Красивый итоговый отчёт для push-all.
+     */
+    private function printPushAllReport(
+        int $totalModels, int $processed, int $successCount,
+        int $errorCount, int $skippedCount, float $startTime
+    ): void {
+        $duration = round(microtime(true) - $startTime, 1);
+        $speed = $processed > 0 && $duration > 0 ? round($processed / $duration, 1) : 0;
+
+        $this->stdout("\n╔══════════════════════════════════════════╗\n", Console::FG_CYAN);
+        $this->stdout("║   РЕЗУЛЬТАТ ПОЛНОЙ СИНХРОНИЗАЦИИ         ║\n", Console::FG_CYAN);
+        $this->stdout("╠══════════════════════════════════════════╣\n", Console::FG_CYAN);
+        $this->stdout("║ Всего моделей:      " . str_pad($totalModels, 20) . "║\n");
+        $this->stdout("║ Обработано:         " . str_pad($processed, 20) . "║\n");
+        $this->stdout("║ Отправлено успешно: " . str_pad($successCount, 20) . "║\n", Console::FG_GREEN);
+        $this->stdout("║ Пропущено:          " . str_pad($skippedCount, 20) . "║\n");
+        $this->stdout("║ Ошибки:             " . str_pad($errorCount, 20) . "║\n",
+            $errorCount > 0 ? Console::FG_RED : Console::FG_GREEN);
+        $this->stdout("║ Время:              " . str_pad("{$duration}s ({$speed} м/с)", 20) . "║\n");
+        $this->stdout("╚══════════════════════════════════════════╝\n\n", Console::FG_CYAN);
     }
 
     // ═══════════════════════════════════════════

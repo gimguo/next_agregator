@@ -24,7 +24,11 @@ $totalAssets = array_sum($statusCounts);
 <div class="media-ui-index">
 
     <div class="d-flex justify-content-between align-items-center mb-4">
-        <h3 class="mb-0" style="font-weight:700">Медиа-файлы (S3/MinIO)</h3>
+        <h3 class="mb-0" style="font-weight:700">&#128247; Медиа-файлы (S3/MinIO)</h3>
+        <span id="live-indicator" class="d-flex align-items-center" style="font-size:.8rem;color:var(--text-secondary)">
+            <span id="live-dot" style="width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block;margin-right:6px;animation:pulse 2s infinite"></span>
+            <span id="live-time"><?= date('H:i:s') ?></span>
+        </span>
     </div>
 
     <!-- ═══ Stats ═══ -->
@@ -196,3 +200,32 @@ $totalAssets = array_sum($statusCounts);
     </div>
 
 </div>
+
+<?php
+$liveUrl = Url::to(['/media-ui/live-stats']);
+$js = <<<JS
+(function() {
+    var timer = null;
+    function fmt(n) { return n.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, " "); }
+    function update() {
+        fetch('{$liveUrl}', {headers:{'X-Requested-With':'XMLHttpRequest'}})
+        .then(function(r){return r.json()})
+        .then(function(d) {
+            document.getElementById('live-dot').style.background = 'var(--success)';
+            document.getElementById('live-time').textContent = d.timestamp;
+            var cards = document.querySelectorAll('.stat-card .stat-value');
+            var vals = [d.total, d.pending, d.downloading, d.processed, d.deduplicated, d.error];
+            cards.forEach(function(c,i){ if(i < vals.length) c.textContent = fmt(vals[i]); });
+        })
+        .catch(function(){ document.getElementById('live-dot').style.background='var(--danger)'; });
+    }
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) { clearInterval(timer); timer=null; }
+        else { update(); timer=setInterval(update, 8000); }
+    });
+    timer = setInterval(update, 8000);
+})();
+JS;
+$this->registerJs($js);
+$this->registerCss('@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}');
+?>
