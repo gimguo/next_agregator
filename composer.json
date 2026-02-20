@@ -1,0 +1,46 @@
+{
+    "name": "gimguo/next-agregator",
+    "description": "Catalog Aggregator — Price Lists, Product Cards, Image Processing",
+    "type": "project",
+    "license": "proprietary",
+    "minimum-stability": "stable",
+    "require": {
+        "php": ">=8.2",
+        "yiisoft/yii2": "~2.0.50",
+        "yiisoft/yii2-bootstrap5": "~2.0.2",
+        "yiisoft/yii2-symfonymailer": "~2.0.3",
+        "yiisoft/yii2-queue": "~2.3",
+        "yiisoft/yii2-redis": "~2.0",
+        "creocoder/yii2-flysystem": "^1.1",
+        "league/flysystem-aws-s3-v3": "^3.25",
+        "intervention/image": "^3.5",
+        "guzzlehttp/guzzle": "^7.8"
+    },
+    "require-dev": {
+        "yiisoft/yii2-debug": "~2.1.0",
+        "yiisoft/yii2-gii": "~2.2.0",
+        "yiisoft/yii2-faker": "~2.0.0"
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "common\\tests\\": ["common/tests/", "common/tests/_support"],
+            "backend\\tests\\": ["backend/tests/", "backend/tests/_support"],
+            "frontend\\tests\\": ["frontend/tests/", "frontend/tests/_support"]
+        }
+    },
+    "config": {
+        "allow-plugins": {
+            "yiisoft/yii2-composer": true
+        },
+        "process-timeout": 1800,
+        "fxp-asset": {
+            "enabled": false
+        }
+    },
+    "repositories": [
+        {
+            "type": "composer",
+            "url": "https://asset-packagist.org"
+        }
+    ]
+}

@@ -1,0 +1,70 @@
+# yii console commands
+/yii
+/yii_test
+/yii_test.bat
+
+# phpstorm / IDE
+.idea
+.vscode
+.cursor
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# composer
+/vendor
+composer.phar
+composer.lock
+
+# phpunit
+phpunit.phar
+/phpunit.xml
+
+# vagrant
+/.vagrant
+
+# generated web entry points
+/frontend/web/index.php
+/frontend/web/index-test.php
+/frontend/web/robots.txt
+/backend/web/index.php
+/backend/web/index-test.php
+/backend/web/robots.txt
+
+# local config (contains passwords)
+/common/config/main-local.php
+/common/config/params-local.php
+/common/config/test-local.php
+/common/config/codeception-local.php
+/console/config/main-local.php
+/console/config/params-local.php
+/console/config/test-local.php
+/backend/config/main-local.php
+/backend/config/params-local.php
+/backend/config/test-local.php
+/backend/config/codeception-local.php
+/frontend/config/main-local.php
+/frontend/config/params-local.php
+/frontend/config/test-local.php
+/frontend/config/codeception-local.php
+
+# runtime & assets
+/frontend/runtime
+/frontend/web/assets
+/backend/runtime
+/backend/web/assets
+/console/runtime
+
+# storage (images, prices, logs)
+/storage/images/*
+/storage/prices/*
+/storage/logs/*
+!/storage/images/.gitkeep
+!/storage/prices/.gitkeep
+!/storage/logs/.gitkeep
+
+# docker volumes data (not needed in repo)
+docker/postgres/data
