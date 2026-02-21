@@ -78,6 +78,11 @@ return [
             'class' => \common\services\PriceCalculationService::class,
         ],
 
+        // ═══ Readiness Scoring — скоринг полноты данных (Sprint 12) ═══
+        'readinessService' => [
+            'class' => \common\services\ReadinessScoringService::class,
+        ],
+
         // ═══ Catalog Persister — материализация DTO → MDM каталог ═══
         'catalogPersister' => [
             'class' => \common\services\CatalogPersisterService::class,

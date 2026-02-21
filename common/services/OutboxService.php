@@ -3,6 +3,7 @@
 namespace common\services;
 
 use common\models\MarketplaceOutbox;
+use common\models\ModelChannelReadiness;
 use common\models\SalesChannel;
 use yii\base\Component;
 use yii\db\JsonExpression;
@@ -31,6 +32,12 @@ use Yii;
  *   Статус 'failed' — задача не будет retry (ошибка 4xx валидации).
  *   markFailed() сохраняет ошибку в channel_sync_errors.
  *
+ * === Readiness Gate (Sprint 12) ===
+ *   Перед созданием content_updated задачи проверяется ReadinessScoringService.
+ *   Если модель не готова (is_ready === false), задача НЕ создаётся.
+ *   Результат кэшируется в model_channel_readiness.
+ *   Fast-Lane (price_updated, stock_updated) НЕ блокируется!
+ *
  * Использование:
  *   $outbox = Yii::$app->get('outbox');
  *   $outbox->emitContentUpdate($modelId, $sessionId);
@@ -42,11 +49,15 @@ class OutboxService extends Component
     /** @var bool Включить дедупликацию (не создавать дубли pending для одной сущности + lane) */
     public bool $deduplication = true;
 
+    /** @var bool Включить проверку готовности перед content_updated (Sprint 12) */
+    public bool $readinessGate = true;
+
     /** @var array Счётчик событий текущей сессии */
     private array $stats = [
         'total'        => 0,
         'created'      => 0,
         'deduplicated' => 0,
+        'blocked'      => 0,
     ];
 
     /** @var SalesChannel[]|null Кэш активных каналов (на время запроса) */
@@ -158,6 +169,9 @@ class OutboxService extends Component
 
     /**
      * Fan-out: создать outbox-запись для КАЖДОГО активного канала.
+     *
+     * Sprint 12: Для lane = content_updated проверяется readiness.
+     * Если модель не готова — задача не создаётся, результат кэшируется.
      */
     protected function fanOut(
         string  $entityType,
@@ -177,6 +191,19 @@ class OutboxService extends Component
         }
 
         foreach ($channels as $channel) {
+            // ═══ READINESS GATE (Sprint 12) ═══
+            // Только для content_updated — цены и остатки НЕ блокируем
+            if ($this->readinessGate && $lane === MarketplaceOutbox::LANE_CONTENT) {
+                if (!$this->checkReadiness($modelId, $channel)) {
+                    $this->stats['blocked']++;
+                    Yii::info(
+                        "OutboxService: BLOCKED content for model_id={$modelId} channel={$channel->name} (not ready)",
+                        'marketplace.outbox'
+                    );
+                    continue;
+                }
+            }
+
             $this->emit($entityType, $entityId, $modelId, $sourceEvent, $lane, $payload, $source, $sessionId, $channel->id);
         }
     }
@@ -478,7 +505,7 @@ class OutboxService extends Component
      */
     public function resetStats(): void
     {
-        $this->stats = ['total' => 0, 'created' => 0, 'deduplicated' => 0];
+        $this->stats = ['total' => 0, 'created' => 0, 'deduplicated' => 0, 'blocked' => 0];
     }
 
     /**
@@ -504,5 +531,28 @@ class OutboxService extends Component
             $this->activeChannelsCache = SalesChannel::findActive();
         }
         return $this->activeChannelsCache;
+    }
+
+    /**
+     * Проверить готовность модели для канала (Sprint 12).
+     *
+     * Использует ReadinessScoringService с кэшированием результата.
+     * Если сервис недоступен — пропускаем проверку (не блокируем).
+     */
+    private function checkReadiness(int $modelId, SalesChannel $channel): bool
+    {
+        try {
+            /** @var ReadinessScoringService $readinessService */
+            $readinessService = Yii::$app->get('readinessService');
+            $report = $readinessService->evaluate($modelId, $channel, true);
+            return $report->isReady;
+        } catch (\Throwable $e) {
+            // Если сервис недоступен или ошибка — не блокируем
+            Yii::warning(
+                "OutboxService: readiness check failed for model_id={$modelId}: {$e->getMessage()}",
+                'marketplace.outbox'
+            );
+            return true;
+        }
     }
 }
