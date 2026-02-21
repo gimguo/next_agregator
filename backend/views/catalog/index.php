@@ -81,7 +81,7 @@ if (!empty($modelIds)) {
                                     . 'style="width:42px;height:42px;object-fit:cover;border-radius:6px;border:1px solid var(--border)">'
                                     . '</a>';
                             }
-                            return '<div style="width:42px;height:42px;border-radius:6px;background:var(--bg-dark);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text-secondary);font-size:.6rem">IMG</div>';
+                            return '<div style="width:42px;height:42px;border-radius:6px;background:var(--bg-body);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text-secondary);font-size:.6rem">IMG</div>';
                         },
                     ],
                     [

@@ -36,6 +36,10 @@ class DashboardController extends Controller
     public function actionIndex(): string
     {
         $stats = $this->collectStats();
+        $stats['readiness'] = $this->collectReadinessStats();
+        $stats['pricing'] = $this->collectPricingStats();
+        $stats['healing'] = $this->collectHealingStats();
+        $stats['scheduler'] = $this->collectSchedulerStats();
 
         return $this->render('index', [
             'stats' => $stats,
@@ -49,11 +53,13 @@ class DashboardController extends Controller
     public function actionLiveStats(): Response
     {
         Yii::$app->response->format = Response::FORMAT_JSON;
-        return $this->asJson($this->collectStats());
+        $stats = $this->collectStats();
+        $stats['readiness'] = $this->collectReadinessStats();
+        return $this->asJson($stats);
     }
 
     /**
-     * Собрать всю статистику для дашборда.
+     * Собрать основную статистику.
      */
     protected function collectStats(): array
     {
@@ -88,15 +94,29 @@ class DashboardController extends Controller
             GROUP BY status
         ")->queryAll();
 
-        $outbox = ['pending' => 0, 'processing' => 0, 'success' => 0, 'error' => 0, 'total' => 0];
+        $outbox = ['pending' => 0, 'processing' => 0, 'success' => 0, 'error' => 0, 'failed' => 0, 'total' => 0];
         foreach ($outboxStats as $row) {
-            $outbox[$row['status']] = (int)$row['cnt'];
+            $key = $row['status'];
+            if (isset($outbox[$key])) {
+                $outbox[$key] = (int)$row['cnt'];
+            }
             $outbox['total'] += (int)$row['cnt'];
         }
 
-        // Уникальные модели в outbox pending
+        // Lane breakdown
+        $laneStats = $db->createCommand("
+            SELECT lane, count(*) as cnt
+            FROM {{%marketplace_outbox}}
+            WHERE status = 'pending'
+            GROUP BY lane
+        ")->queryAll();
+        $outbox['lanes'] = [];
+        foreach ($laneStats as $row) {
+            $outbox['lanes'][$row['lane']] = (int)$row['cnt'];
+        }
+
         $outbox['pending_models'] = (int)$db->createCommand("
-            SELECT count(DISTINCT model_id) FROM {{%marketplace_outbox}} WHERE status='pending'
+            SELECT count(DISTINCT entity_id) FROM {{%marketplace_outbox}} WHERE status='pending' AND entity_type='model'
         ")->queryScalar();
 
         // ═══ Staging ═══
@@ -104,11 +124,6 @@ class DashboardController extends Controller
         try {
             $stagingCount = (int)$db->createCommand("SELECT count(*) FROM {{%staging_raw_offers}}")->queryScalar();
         } catch (\Exception $e) {}
-
-        // ═══ Последняя сессия импорта ═══
-        $lastSession = $db->createCommand("
-            SELECT * FROM {{%import_sessions}} ORDER BY created_at DESC LIMIT 1
-        ")->queryOne();
 
         // ═══ Brands / Categories ═══
         $brandsCount = (int)$db->createCommand("SELECT count(*) FROM {{%brands}}")->queryScalar();
@@ -129,7 +144,7 @@ class DashboardController extends Controller
             FROM {{%product_models}} pm
             LEFT JOIN {{%brands}} b ON b.id = pm.brand_id
             ORDER BY pm.created_at DESC
-            LIMIT 12
+            LIMIT 10
         ")->queryAll();
 
         return [
@@ -154,9 +169,110 @@ class DashboardController extends Controller
                 'brands' => $brandsCount,
                 'categories' => $categoriesCount,
             ],
-            'lastSession' => $lastSession,
             'recentModels' => $recentModels,
             'timestamp' => date('H:i:s'),
         ];
+    }
+
+    /**
+     * Readiness scoring stats.
+     */
+    protected function collectReadinessStats(): array
+    {
+        $db = Yii::$app->db;
+        try {
+            $stats = $db->createCommand("
+                SELECT
+                    sc.name as channel_name,
+                    sc.driver,
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE mcr.is_ready = true) AS ready,
+                    COUNT(*) FILTER (WHERE mcr.is_ready = false) AS not_ready,
+                    ROUND(AVG(mcr.score)::numeric, 1) AS avg_score
+                FROM {{%model_channel_readiness}} mcr
+                JOIN {{%sales_channels}} sc ON sc.id = mcr.channel_id
+                GROUP BY sc.id, sc.name, sc.driver
+                ORDER BY sc.name
+            ")->queryAll();
+
+            return $stats ?: [];
+        } catch (\Exception $e) {
+            return [];
+        }
+    }
+
+    /**
+     * Pricing engine stats.
+     */
+    protected function collectPricingStats(): array
+    {
+        $db = Yii::$app->db;
+        try {
+            $rulesCount = (int)$db->createCommand("SELECT count(*) FROM {{%pricing_rules}} WHERE is_active = true")->queryScalar();
+            $withRetailPrice = (int)$db->createCommand("SELECT count(*) FROM {{%supplier_offers}} WHERE retail_price IS NOT NULL AND retail_price > 0")->queryScalar();
+            $totalOffers = (int)$db->createCommand("SELECT count(*) FROM {{%supplier_offers}}")->queryScalar();
+            return [
+                'active_rules' => $rulesCount,
+                'with_retail_price' => $withRetailPrice,
+                'total_offers' => $totalOffers,
+            ];
+        } catch (\Exception $e) {
+            return ['active_rules' => 0, 'with_retail_price' => 0, 'total_offers' => 0];
+        }
+    }
+
+    /**
+     * AI healing stats.
+     */
+    protected function collectHealingStats(): array
+    {
+        $db = Yii::$app->db;
+        try {
+            $healed = (int)$db->createCommand("
+                SELECT count(*) FROM {{%model_channel_readiness}}
+                WHERE last_heal_attempt_at IS NOT NULL
+            ")->queryScalar();
+
+            $healedAndReady = (int)$db->createCommand("
+                SELECT count(*) FROM {{%model_channel_readiness}}
+                WHERE last_heal_attempt_at IS NOT NULL AND is_ready = true
+            ")->queryScalar();
+
+            // Queue info
+            $queueWaiting = 0;
+            try {
+                $redis = Yii::$app->redis;
+                $queueWaiting = (int)$redis->executeCommand('LLEN', ['agregator-queue.waiting']);
+            } catch (\Exception $e) {}
+
+            return [
+                'total_healed' => $healed,
+                'healed_and_ready' => $healedAndReady,
+                'queue_waiting' => $queueWaiting,
+            ];
+        } catch (\Exception $e) {
+            return ['total_healed' => 0, 'healed_and_ready' => 0, 'queue_waiting' => 0];
+        }
+    }
+
+    /**
+     * Scheduler stats.
+     */
+    protected function collectSchedulerStats(): array
+    {
+        $db = Yii::$app->db;
+        try {
+            $configs = $db->createCommand("
+                SELECT sfc.id, s.name as supplier_name, sfc.source_type, sfc.cron_schedule,
+                       sfc.last_fetch_at, sfc.last_status, sfc.is_active
+                FROM {{%supplier_fetch_configs}} sfc
+                JOIN {{%suppliers}} s ON s.id = sfc.supplier_id
+                WHERE sfc.is_active = true
+                ORDER BY sfc.last_fetch_at DESC NULLS LAST
+            ")->queryAll();
+            return $configs ?: [];
+        } catch (\Exception $e) {
+            return [];
+        }
     }
 }

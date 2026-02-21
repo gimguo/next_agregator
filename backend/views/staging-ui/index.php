@@ -155,7 +155,7 @@ $totalRecords = array_sum($statusCounts);
                             }
                             $json = json_encode($decoded, JSON_UNESCAPED_UNICODE);
                             $short = mb_strimwidth($json, 0, 100, '...');
-                            return '<pre style="background:var(--bg-dark);color:var(--text-secondary);padding:4px 8px;border-radius:4px;margin:0;font-size:.75rem;max-width:350px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis" title="'
+                            return '<pre style="background:var(--bg-body);color:var(--text-secondary);padding:4px 8px;border-radius:4px;margin:0;font-size:.75rem;max-width:350px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis" title="'
                                 . Html::encode($json) . '">'
                                 . Html::encode($short)
                                 . '</pre>';

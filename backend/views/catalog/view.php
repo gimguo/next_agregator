@@ -100,7 +100,7 @@ $this->params['breadcrumbs'][] = "#{$model->id}";
                                 $attrs = json_decode($attrs, true);
                             }
                             if (empty($attrs)) return '—';
-                            return '<pre style="background:var(--bg-dark);color:var(--text-primary);padding:10px;border-radius:6px;margin:0;max-height:300px;overflow:auto;font-size:.82rem">'
+                            return '<pre style="background:var(--bg-body);color:var(--text-primary);padding:10px;border-radius:6px;margin:0;max-height:300px;overflow:auto;font-size:.82rem">'
                                 . Html::encode(json_encode($attrs, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT))
                                 . '</pre>';
                         },
@@ -135,7 +135,7 @@ $this->params['breadcrumbs'][] = "#{$model->id}";
                 <div class="row g-3">
                     <?php foreach ($images as $image): ?>
                         <div class="col-xl-2 col-lg-3 col-md-4 col-6">
-                            <div style="background:var(--bg-dark);border:1px solid var(--border);border-radius:8px;overflow:hidden;position:relative">
+                            <div style="background:var(--bg-body);border:1px solid var(--border);border-radius:8px;overflow:hidden;position:relative">
                                 <?php
                                 $thumbUrl = $image->getThumbUrl();
                                 $fullUrl = $image->getPublicUrl();
@@ -221,7 +221,7 @@ $this->params['breadcrumbs'][] = "#{$model->id}";
                         if (!empty($attrs)):
                         ?>
                             <div class="mb-2">
-                                <pre style="background:var(--bg-dark);color:var(--text-primary);padding:8px 12px;border-radius:6px;margin:0;font-size:.8rem;display:inline-block"><?= Html::encode(json_encode($attrs, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT)) ?></pre>
+                                <pre style="background:var(--bg-body);color:var(--text-primary);padding:8px 12px;border-radius:6px;margin:0;font-size:.8rem;display:inline-block"><?= Html::encode(json_encode($attrs, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT)) ?></pre>
                             </div>
                         <?php endif; ?>
 

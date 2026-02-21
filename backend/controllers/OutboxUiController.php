@@ -33,6 +33,7 @@ class OutboxUiController extends Controller
         // Фильтры
         $status = Yii::$app->request->get('status');
         $entityType = Yii::$app->request->get('entity_type');
+        $lane = Yii::$app->request->get('lane');
 
         if ($status) {
             $query->andWhere(['status' => $status]);
@@ -40,22 +41,32 @@ class OutboxUiController extends Controller
         if ($entityType) {
             $query->andWhere(['entity_type' => $entityType]);
         }
+        if ($lane) {
+            $query->andWhere(['lane' => $lane]);
+        }
 
         $dataProvider = new ActiveDataProvider([
             'query' => $query,
             'pagination' => ['pageSize' => 50],
         ]);
 
-        // Статистика
+        // Статистика по статусам
         $stats = Yii::$app->db->createCommand("
             SELECT status, count(*) as cnt FROM {{%marketplace_outbox}} GROUP BY status ORDER BY status
+        ")->queryAll();
+
+        // Статистика по лейнам
+        $laneStats = Yii::$app->db->createCommand("
+            SELECT lane, count(*) as cnt FROM {{%marketplace_outbox}} WHERE status='pending' GROUP BY lane ORDER BY lane
         ")->queryAll();
 
         return $this->render('index', [
             'dataProvider' => $dataProvider,
             'status' => $status,
             'entityType' => $entityType,
+            'lane' => $lane,
             'stats' => $stats,
+            'laneStats' => $laneStats,
         ]);
     }
 
@@ -70,9 +81,11 @@ class OutboxUiController extends Controller
             SELECT status, count(*) as cnt FROM {{%marketplace_outbox}} GROUP BY status ORDER BY status
         ")->queryAll();
 
-        $result = ['pending' => 0, 'processing' => 0, 'success' => 0, 'error' => 0, 'total' => 0];
+        $result = ['pending' => 0, 'processing' => 0, 'success' => 0, 'error' => 0, 'failed' => 0, 'total' => 0];
         foreach ($stats as $row) {
-            $result[$row['status']] = (int)$row['cnt'];
+            if (isset($result[$row['status']])) {
+                $result[$row['status']] = (int)$row['cnt'];
+            }
             $result['total'] += (int)$row['cnt'];
         }
 
