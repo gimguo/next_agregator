@@ -263,7 +263,7 @@ $pendingImages = Yii::$app->db->createCommand("
                         <tr>
                             <td>
                                 <?php if ($offer->card): ?>
-                                    <a href="<?= Url::to(['/product-card/view', 'id' => $offer->card_id]) ?>"
+                                    <a href="<?= Url::to(['/catalog/view', 'id' => $offer->model_id ?? $offer->card_id]) ?>"
                                        style="color:var(--accent);text-decoration:none">
                                         <?= Html::encode(mb_strimwidth($offer->card->canonical_name, 0, 50, '...')) ?>
                                     </a>

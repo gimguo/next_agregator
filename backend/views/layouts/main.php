@@ -55,19 +55,13 @@ $action = Yii::$app->controller->action->id ?? '';
             [
                 'label' => '<i class="fas fa-database"></i> Каталог',
                 'encode' => false,
-                'active' => in_array($controller, ['catalog', 'product-card']),
+                'active' => in_array($controller, ['catalog', 'pricing-rule']),
                 'items' => [
                     [
                         'label' => '<i class="fas fa-boxes-stacked fa-fw"></i> MDM Модели',
                         'encode' => false,
                         'url' => ['/catalog/index'],
                         'active' => $controller === 'catalog',
-                    ],
-                    [
-                        'label' => '<i class="fas fa-id-card fa-fw"></i> Карточки (legacy)',
-                        'encode' => false,
-                        'url' => ['/product-card/index'],
-                        'active' => $controller === 'product-card',
                     ],
                     '<li><hr class="dropdown-divider"></li>',
                     [
