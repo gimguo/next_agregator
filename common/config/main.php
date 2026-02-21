@@ -83,6 +83,11 @@ return [
             'class' => \common\services\ReadinessScoringService::class,
         ],
 
+        // ═══ Auto-Healing — AI самовосстановление каталога (Sprint 13) ═══
+        'autoHealer' => [
+            'class' => \common\services\AutoHealingService::class,
+        ],
+
         // ═══ Catalog Persister — материализация DTO → MDM каталог ═══
         'catalogPersister' => [
             'class' => \common\services\CatalogPersisterService::class,

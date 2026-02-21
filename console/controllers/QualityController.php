@@ -2,10 +2,12 @@
 
 namespace console\controllers;
 
+use common\dto\HealingResultDTO;
 use common\dto\ReadinessReportDTO;
 use common\models\ChannelRequirement;
 use common\models\ModelChannelReadiness;
 use common\models\SalesChannel;
+use common\services\AutoHealingService;
 use common\services\ReadinessScoringService;
 use yii\console\Controller;
 use yii\console\ExitCode;
@@ -13,9 +15,10 @@ use yii\helpers\Console;
 use Yii;
 
 /**
- * Sprint 12 — Data Completeness & Channel Readiness.
+ * Sprint 12+13 — Data Completeness, Channel Readiness & AI Auto-Healing.
  *
- * Инструменты скоринга качества карточек товаров для маркетплейсов.
+ * Инструменты скоринга качества карточек товаров для маркетплейсов
+ * и AI-лечения неполных карточек.
  *
  * Команды:
  *   php yii quality/scan --channel=rosmatras     # Полный скоринг всех моделей
@@ -24,10 +27,13 @@ use Yii;
  *   php yii quality/report --channel=rosmatras   # Отчёт по одному каналу
  *   php yii quality/check --model=123            # Проверить конкретную модель
  *   php yii quality/requirements                 # Показать требования каналов
+ *   php yii quality/heal --channel=rosmatras     # AI-лечение неполных карточек
+ *   php yii quality/heal --limit=50              # Лечить до 50 моделей
+ *   php yii quality/heal --dry-run               # Только показать, что будет лечиться
  */
 class QualityController extends Controller
 {
-    /** @var string Драйвер канала или ID (для scan/report) */
+    /** @var string Драйвер канала или ID (для scan/report/heal) */
     public string $channel = '';
 
     /** @var int ID модели (для check) */
@@ -36,13 +42,19 @@ class QualityController extends Controller
     /** @var int Топ N проблем в отчёте */
     public int $top = 15;
 
+    /** @var int Лимит моделей для heal */
+    public int $limit = 50;
+
+    /** @var bool Dry-run — показать что будет лечиться, не лечить */
+    public bool $dryRun = false;
+
     /** @var ReadinessScoringService */
     private ReadinessScoringService $readinessService;
 
     public function options($actionID): array
     {
         return array_merge(parent::options($actionID), [
-            'channel', 'model', 'top',
+            'channel', 'model', 'top', 'limit', 'dryRun',
         ]);
     }
 
@@ -370,6 +382,307 @@ class QualityController extends Controller
     }
 
     // ═══════════════════════════════════════════
+    // HEAL — AI Auto-Healing (Sprint 13)
+    // ═══════════════════════════════════════════
+
+    /**
+     * AI-лечение неполных карточек товаров.
+     *
+     * Выбирает модели с is_ready=false, у которых есть лечимые поля
+     * (описание, атрибуты) и вызывает AutoHealingService.
+     *
+     * php yii quality/heal --channel=rosmatras
+     * php yii quality/heal --channel=rosmatras --limit=100
+     * php yii quality/heal --channel=rosmatras --dry-run
+     */
+    public function actionHeal(): int
+    {
+        $channel = $this->resolveChannel();
+        if (!$channel) {
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
+
+        $this->stdout("\n  ╔══════════════════════════════════════════════════════════════════════╗\n", Console::FG_PURPLE);
+        $this->stdout("  ║  🧬 AI AUTO-HEALING — Самовосстановление каталога                   ║\n", Console::FG_PURPLE);
+        $this->stdout("  ╚══════════════════════════════════════════════════════════════════════╝\n\n", Console::FG_PURPLE);
+
+        $this->stdout("  Канал:     {$channel->name} ({$channel->driver})\n");
+        $this->stdout("  Лимит:     {$this->limit} моделей\n");
+        $this->stdout("  Dry-run:   " . ($this->dryRun ? 'Да (только анализ)' : 'Нет (лечим!)') . "\n\n");
+
+        /** @var AutoHealingService $healer */
+        $healer = Yii::$app->get('autoHealer');
+
+        // Проверяем доступность AI
+        /** @var \common\services\AIService $ai */
+        $ai = Yii::$app->get('aiService');
+        if (!$ai->isAvailable() && !$this->dryRun) {
+            $this->stderr("  ❌ AI сервис недоступен (нет API ключа OpenRouter)\n\n", Console::FG_RED);
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
+
+        $this->stdout("  AI модель: {$ai->model}\n\n");
+
+        // Выбираем кандидатов для лечения
+        $db = Yii::$app->db;
+
+        // Модели, которые:
+        //   1. is_ready = false
+        //   2. last_heal_attempt_at IS NULL ИЛИ старше 24ч
+        //   3. Имеют лечимые поля (не только image/barcode/price/brand)
+        $cooldownInterval = $healer->healCooldownSeconds;
+        $candidates = $db->createCommand("
+            SELECT mcr.model_id, mcr.score, mcr.missing_fields,
+                   pm.name AS model_name, pm.product_family,
+                   b.canonical_name AS brand_name
+            FROM {{%model_channel_readiness}} mcr
+            JOIN {{%product_models}} pm ON pm.id = mcr.model_id
+            LEFT JOIN {{%brands}} b ON b.id = pm.brand_id
+            WHERE mcr.channel_id = :cid
+              AND mcr.is_ready = false
+              AND (mcr.last_heal_attempt_at IS NULL OR mcr.last_heal_attempt_at < NOW() - INTERVAL '{$cooldownInterval} seconds')
+            ORDER BY mcr.score DESC, mcr.model_id
+            LIMIT :limit
+        ", [':cid' => $channel->id, ':limit' => $this->limit * 3])->queryAll(); // берём больше, потом фильтруем
+
+        // Фильтруем: оставляем только модели с лечимыми полями
+        $healableCandidates = [];
+        foreach ($candidates as $row) {
+            $missing = $this->parseJson($row['missing_fields']);
+            if ($healer->hasHealableFields($missing)) {
+                $healableCandidates[] = array_merge($row, ['missing' => $missing]);
+            }
+            if (count($healableCandidates) >= $this->limit) {
+                break;
+            }
+        }
+
+        $totalCandidates = count($healableCandidates);
+
+        if ($totalCandidates === 0) {
+            $this->stdout("  ℹ️  Нет моделей для лечения (все уже лечились или нужны только фото/цены).\n\n", Console::FG_YELLOW);
+            return ExitCode::OK;
+        }
+
+        $this->stdout("  Найдено кандидатов: {$totalCandidates}\n");
+
+        // Dry-run: только показываем список
+        if ($this->dryRun) {
+            $this->stdout("\n  ── Кандидаты для лечения (dry-run) ──\n\n", Console::FG_YELLOW);
+            $this->stdout(sprintf("  %-6s %-40s %-12s %s\n", 'ID', 'Название', 'Скор', 'Чего не хватает'), Console::BOLD);
+            $this->stdout("  " . str_repeat('─', 90) . "\n");
+
+            foreach ($healableCandidates as $row) {
+                $healableFields = array_filter($row['missing'], fn($f) => !$this->isUnhealableField($f));
+                $fieldsStr = implode(', ', array_map(fn($f) => ReadinessReportDTO::labelFor($f), array_slice($healableFields, 0, 3)));
+                if (count($healableFields) > 3) {
+                    $fieldsStr .= ' +' . (count($healableFields) - 3);
+                }
+
+                $this->stdout(sprintf(
+                    "  %-6d %-40s %3d%%        %s\n",
+                    (int)$row['model_id'],
+                    mb_substr($row['model_name'], 0, 38),
+                    (int)$row['score'],
+                    $fieldsStr
+                ));
+            }
+
+            $this->stdout("\n  Для запуска лечения уберите --dry-run\n\n");
+            return ExitCode::OK;
+        }
+
+        // ═══ РЕАЛЬНОЕ ЛЕЧЕНИЕ ═══
+        $this->stdout("\n");
+        Console::startProgress(0, $totalCandidates, '  Лечим: ');
+
+        $healed = 0;
+        $pushed = 0;
+        $failed = 0;
+        $skipped = 0;
+        $errors = [];
+
+        foreach ($healableCandidates as $i => $row) {
+            $modelId = (int)$row['model_id'];
+
+            try {
+                $result = $healer->healModel($modelId, $row['missing'], $channel);
+
+                if ($result->success) {
+                    $healed++;
+                    if ($result->isFullyHealed()) {
+                        $pushed++;
+                    }
+                } else {
+                    if (!empty($result->errors)) {
+                        $failed++;
+                        $errors[] = "#{$modelId}: " . implode('; ', $result->errors);
+                    } else {
+                        $skipped++;
+                    }
+                }
+            } catch (\Throwable $e) {
+                $failed++;
+                $errors[] = "#{$modelId}: Exception — {$e->getMessage()}";
+                Yii::error("AutoHealing exception model_id={$modelId}: {$e->getMessage()}", 'ai.healing');
+
+                // Если API упал — прерываем, чтобы не тратить лимит
+                if (stripos($e->getMessage(), 'cURL error') !== false
+                    || stripos($e->getMessage(), 'Connection') !== false
+                    || stripos($e->getMessage(), '429') !== false
+                    || stripos($e->getMessage(), '503') !== false) {
+                    Console::endProgress();
+                    $this->stderr("\n\n  ⚠️  API недоступен, прерываем лечение.\n", Console::FG_RED);
+                    $this->stderr("  Ошибка: {$e->getMessage()}\n\n", Console::FG_RED);
+                    break;
+                }
+            }
+
+            Console::updateProgress($i + 1, $totalCandidates);
+        }
+
+        Console::endProgress();
+
+        // ═══ ИТОГИ ═══
+        $this->stdout("\n  ╔══════════════════════════════════════════════════════════════╗\n", Console::FG_GREEN);
+        $this->stdout("  ║  РЕЗУЛЬТАТЫ ЛЕЧЕНИЯ                                        ║\n", Console::FG_GREEN);
+        $this->stdout("  ╚══════════════════════════════════════════════════════════════╝\n\n", Console::FG_GREEN);
+
+        $this->stdout("  Обработано:       {$totalCandidates}\n");
+        $this->stdout("  Исцелено:         ");
+        $this->stdout("{$healed}\n", $healed > 0 ? Console::FG_GREEN : Console::FG_YELLOW);
+        $this->stdout("  → Отправлено:     ");
+        $this->stdout("{$pushed} (на витрину)\n", $pushed > 0 ? Console::FG_GREEN : Console::FG_YELLOW);
+        $this->stdout("  Пропущено:        {$skipped}\n");
+        $this->stdout("  Ошибки:           ");
+        $this->stdout("{$failed}\n", $failed > 0 ? Console::FG_RED : Console::FG_GREEN);
+
+        if (!empty($errors)) {
+            $this->stdout("\n  ── Ошибки ──\n", Console::FG_RED);
+            foreach (array_slice($errors, 0, 10) as $err) {
+                $this->stdout("    • {$err}\n");
+            }
+            if (count($errors) > 10) {
+                $this->stdout("    ... и ещё " . (count($errors) - 10) . " ошибок\n");
+            }
+        }
+
+        $this->stdout("\n");
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Вылечить одну конкретную модель.
+     *
+     * php yii quality/heal-one --model=123 --channel=rosmatras
+     */
+    public function actionHealOne(): int
+    {
+        if (!$this->model) {
+            $this->stderr("\n  Укажите --model=ID и --channel=DRIVER\n\n", Console::FG_RED);
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
+
+        $channel = $this->resolveChannel();
+        if (!$channel) {
+            return ExitCode::UNSPECIFIED_ERROR;
+        }
+
+        $this->stdout("\n  ╔══════════════════════════════════════════════════════════════════════╗\n", Console::FG_PURPLE);
+        $this->stdout("  ║  🧬 AI HEAL-ONE — Лечение конкретной модели                         ║\n", Console::FG_PURPLE);
+        $this->stdout("  ╚══════════════════════════════════════════════════════════════════════╝\n\n", Console::FG_PURPLE);
+
+        // Получаем текущий readiness
+        $report = $this->readinessService->evaluate($this->model, $channel, true);
+
+        $this->stdout("  Модель:     #{$this->model}\n");
+        $this->stdout("  Канал:      {$channel->name}\n");
+        $this->stdout("  Готовность: " . ($report->isReady ? '✅ ГОТОВА' : '❌ НЕ ГОТОВА') . " ({$report->score}%)\n");
+
+        if ($report->isReady) {
+            $this->stdout("\n  Модель уже готова, лечение не требуется.\n\n", Console::FG_GREEN);
+            return ExitCode::OK;
+        }
+
+        $this->stdout("  Пропуски:\n");
+        foreach ($report->missing as $field) {
+            $label = ReadinessReportDTO::labelFor($field);
+            $this->stdout("    • {$label}\n");
+        }
+
+        /** @var AutoHealingService $healer */
+        $healer = Yii::$app->get('autoHealer');
+
+        if (!$healer->hasHealableFields($report->missing)) {
+            $this->stdout("\n  ⚠️  Нет лечимых полей (нужны фото/штрихкод/цена/бренд).\n\n", Console::FG_YELLOW);
+            return ExitCode::OK;
+        }
+
+        $this->stdout("\n  Запускаем AI лечение...\n\n");
+
+        $result = $healer->healModel($this->model, $report->missing, $channel);
+
+        // Результат
+        if ($result->success) {
+            $this->stdout("  ✅ Лечение успешно!\n\n", Console::FG_GREEN);
+
+            if (!empty($result->healedFields)) {
+                $this->stdout("  Исцелённые поля:\n", Console::FG_GREEN);
+                foreach ($result->healedFields as $field) {
+                    $this->stdout("    ✓ {$field}\n", Console::FG_GREEN);
+                }
+            }
+
+            if ($result->description) {
+                $this->stdout("\n  Сгенерированное описание:\n", Console::BOLD);
+                $this->stdout("  " . str_repeat('─', 60) . "\n");
+                // Показываем первые 300 символов
+                $preview = mb_substr($result->description, 0, 300);
+                $this->stdout("  {$preview}...\n");
+                $this->stdout("  " . str_repeat('─', 60) . "\n");
+                $this->stdout("  Длина: " . mb_strlen($result->description) . " символов\n");
+            }
+
+            if (!empty($result->attributes)) {
+                $this->stdout("\n  Определённые атрибуты:\n", Console::BOLD);
+                foreach ($result->attributes as $key => $value) {
+                    $this->stdout("    {$key}: {$value}\n");
+                }
+            }
+
+            $this->stdout("\n  Новый скор: {$result->newScore}%\n");
+            if ($result->isFullyHealed()) {
+                $this->stdout("  🚀 Модель отправлена на витрину через Outbox!\n", Console::FG_GREEN);
+            }
+        } else {
+            $this->stdout("  ❌ Лечение не удалось.\n\n", Console::FG_RED);
+            foreach ($result->errors as $err) {
+                $this->stdout("    • {$err}\n", Console::FG_RED);
+            }
+        }
+
+        if (!empty($result->skippedFields)) {
+            $this->stdout("\n  Пропущенные (нельзя лечить ИИ):\n", Console::FG_YELLOW);
+            foreach ($result->skippedFields as $field) {
+                $label = ReadinessReportDTO::labelFor($field);
+                $this->stdout("    ⏭ {$label}\n", Console::FG_YELLOW);
+            }
+        }
+
+        if (!empty($result->failedFields)) {
+            $this->stdout("\n  Не удалось определить:\n", Console::FG_RED);
+            foreach ($result->failedFields as $field) {
+                $this->stdout("    ✗ {$field}\n", Console::FG_RED);
+            }
+        }
+
+        $this->stdout("\n");
+
+        return ExitCode::OK;
+    }
+
+    // ═══════════════════════════════════════════
     // HELPERS
     // ═══════════════════════════════════════════
 
@@ -396,6 +709,26 @@ class QualityController extends Controller
         }
 
         return $channel;
+    }
+
+    /**
+     * Безопасный парсинг JSON.
+     */
+    private function parseJson($value): array
+    {
+        if (empty($value)) return [];
+        if (is_string($value)) return json_decode($value, true) ?: [];
+        return is_array($value) ? $value : [];
+    }
+
+    /**
+     * Проверка, что поле не лечится ИИ (для dry-run вывода).
+     */
+    private function isUnhealableField(string $field): bool
+    {
+        return in_array($field, [
+            'required:image', 'required:barcode', 'required:price', 'required:brand',
+        ]);
     }
 
     /**

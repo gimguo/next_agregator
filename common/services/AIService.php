@@ -71,7 +71,13 @@ class AIService extends Component
      */
     public function isAvailable(): bool
     {
-        return !empty($this->apiKey) && $this->apiKey !== 'your-openrouter-api-key';
+        if (empty($this->apiKey)) {
+            return false;
+        }
+
+        // Плейсхолдеры
+        $placeholders = ['your-openrouter-api-key', 'sk-or-v1-your-key-here'];
+        return !in_array($this->apiKey, $placeholders, true);
     }
 
     /**
@@ -612,7 +618,7 @@ PROMPT;
     }
 
     /**
-     * Генерация описания товара.
+     * Генерация описания товара (legacy — простой текст).
      */
     public function generateDescription(string $productName, string $brand, string $existingDescription = ''): string
     {
@@ -629,6 +635,188 @@ PROMPT;
 PROMPT;
 
         return trim($this->chat($prompt, 0.7, 1000));
+    }
+
+    // ═══════════════════════════════════════════
+    // AUTO-HEALING (Sprint 13)
+    // ═══════════════════════════════════════════
+
+    /**
+     * Генерация SEO-описания для модели (Auto-Healing).
+     *
+     * Использует все имеющиеся данные модели: название, бренд, семейство, атрибуты.
+     * Возвращает description + short_description в JSON.
+     *
+     * @param string $modelName     Название модели ("Орматек Оптима")
+     * @param string $brand         Бренд ("Орматек")
+     * @param string $family        Семейство ("mattress")
+     * @param array  $attributes    Канонические атрибуты модели
+     * @param string $existingDesc  Существующее описание (если есть)
+     * @return array{description: string, short_description: string}|null
+     */
+    public function generateSeoDescription(
+        string $modelName,
+        string $brand,
+        string $family,
+        array  $attributes = [],
+        string $existingDesc = ''
+    ): ?array {
+        $attrsJson = !empty($attributes)
+            ? json_encode($attributes, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT)
+            : 'Нет данных';
+
+        $familyLabel = $this->getFamilyLabel($family);
+
+        $prompt = <<<PROMPT
+Напиши продающее SEO-описание для товара категории «{$familyLabel}».
+
+═══ ТОВАР ═══
+Название: {$modelName}
+Бренд: {$brand}
+Тип товара: {$familyLabel}
+
+═══ ХАРАКТЕРИСТИКИ ═══
+{$attrsJson}
+
+═══ СУЩЕСТВУЮЩЕЕ ОПИСАНИЕ ═══
+{$existingDesc}
+
+═══ ПРАВИЛА ═══
+1. Полное описание: 1000-1500 символов, разбитое на 3-4 абзаца.
+2. Краткое описание: 1-2 предложения (до 200 символов), для карточки в каталоге.
+3. Текст должен быть на русском, продающий, без «воды».
+4. Упоминай ТОЛЬКО те характеристики, что указаны выше. НЕ выдумывай.
+5. Если характеристик мало — фокусируйся на бренде и общих преимуществах типа товара.
+6. Используй абзацы (\n\n) для разделения блоков текста.
+
+Ответь СТРОГО в JSON:
+{
+  "description": "полное описание",
+  "short_description": "краткое описание для каталога"
+}
+PROMPT;
+
+        $result = $this->chat($prompt, 0.7, 2000);
+        $parsed = $this->parseJsonResponse($result);
+
+        if (empty($parsed['description'])) {
+            return null;
+        }
+
+        return [
+            'description'       => trim($parsed['description']),
+            'short_description' => trim($parsed['short_description'] ?? ''),
+        ];
+    }
+
+    /**
+     * Определение недостающих атрибутов на основе названия и контекста (Auto-Healing).
+     *
+     * AI анализирует название, бренд, семейство и пытается определить
+     * значения недостающих атрибутов.
+     *
+     * @param string $modelName        Название модели
+     * @param string $brand            Бренд
+     * @param string $family           Семейство товара
+     * @param array  $targetAttributes Список атрибутов для определения ['frame_material', 'color']
+     * @param array  $existingAttrs    Уже известные атрибуты модели
+     * @return array Массив определённых атрибутов (ключ => значение), пустые = не определено
+     */
+    public function inferMissingAttributes(
+        string $modelName,
+        string $brand,
+        string $family,
+        array  $targetAttributes,
+        array  $existingAttrs = []
+    ): array {
+        if (empty($targetAttributes)) {
+            return [];
+        }
+
+        $existingJson = !empty($existingAttrs)
+            ? json_encode($existingAttrs, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT)
+            : 'Нет данных';
+
+        $attrsList = implode(', ', $targetAttributes);
+        $familyLabel = $this->getFamilyLabel($family);
+
+        // Получаем JSON-схему для семейства (если есть)
+        $schemaBlock = '';
+        try {
+            $familyEnum = ProductFamily::tryFrom($family);
+            if ($familyEnum) {
+                $schemaBlock = ProductFamilySchema::buildPromptBlock($familyEnum);
+            }
+        } catch (\Throwable $e) {
+            // Нет схемы — не страшно
+        }
+
+        $schemaSection = $schemaBlock
+            ? "\n═══ СХЕМА АТРИБУТОВ ═══\n{$schemaBlock}\n"
+            : '';
+
+        $prompt = <<<PROMPT
+Для товара категории «{$familyLabel}» определи значения следующих атрибутов: {$attrsList}.
+
+═══ ТОВАР ═══
+Название: {$modelName}
+Бренд: {$brand}
+Тип товара: {$familyLabel}
+
+═══ ИЗВЕСТНЫЕ АТРИБУТЫ ═══
+{$existingJson}
+{$schemaSection}
+═══ ПРАВИЛА ═══
+1. Определяй ТОЛЬКО те атрибуты, что указаны в задании: {$attrsList}
+2. Если значение МОЖНО уверенно определить из названия/контекста — укажи его.
+3. Если значение НЕЛЬЗЯ определить — ставь null.
+4. Размеры (width, length, height) — только числа в сантиметрах.
+5. Для enum-полей используй ТОЛЬКО допустимые значения из схемы.
+6. НЕ выдумывай. Лучше null, чем неверное значение.
+
+Ответь СТРОГО в JSON:
+{
+  "attributes": {
+    "ключ_атрибута": "значение или null"
+  },
+  "confidence": 0.0-1.0
+}
+PROMPT;
+
+        $result = $this->chat($prompt, 0.2, 1000);
+        $parsed = $this->parseJsonResponse($result);
+
+        $attributes = $parsed['attributes'] ?? $parsed;
+
+        // Фильтруем — оставляем только запрошенные и не-null
+        $filtered = [];
+        foreach ($targetAttributes as $key) {
+            if (isset($attributes[$key]) && $attributes[$key] !== null && $attributes[$key] !== '' && $attributes[$key] !== 'null') {
+                $filtered[$key] = $attributes[$key];
+            }
+        }
+
+        return $filtered;
+    }
+
+    /**
+     * Человекочитаемое название семейства товаров.
+     */
+    private function getFamilyLabel(string $family): string
+    {
+        $map = [
+            'mattress'  => 'Матрас',
+            'pillow'    => 'Подушка',
+            'blanket'   => 'Одеяло',
+            'bed'       => 'Кровать',
+            'base'      => 'Основание для кровати',
+            'topper'    => 'Топпер',
+            'protector' => 'Наматрасник',
+            'bedlinen'  => 'Постельное бельё',
+            'furniture' => 'Мебель',
+            'accessory' => 'Аксессуар',
+        ];
+        return $map[$family] ?? $family;
     }
 
     /**
