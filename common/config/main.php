@@ -57,9 +57,14 @@ return [
             'cleanupHours' => 48, // Авто-очистка сессий старше 48 часов
         ],
 
-        // ═══ Получение прайсов (FTP, URL, Email, API) ═══
+        // ═══ Получение прайсов (FTP, URL, Email, API) — Legacy ═══
         'priceFetcher' => [
             'class' => \common\services\PriceFetcher::class,
+        ],
+
+        // ═══ Fetcher Factory — Strategy Pattern (Sprint 14) ═══
+        'fetcherFactory' => [
+            'class' => \common\services\fetcher\FetcherFactory::class,
         ],
 
         // ═══ MDM Matching Engine (Chain of Responsibility) ═══

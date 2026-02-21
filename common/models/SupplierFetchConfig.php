@@ -3,6 +3,8 @@
 namespace common\models;
 
 use yii\db\ActiveRecord;
+use yii\behaviors\TimestampBehavior;
+use yii\db\Expression;
 
 /**
  * Конфигурация автоматического получения прайсов.
@@ -39,6 +41,10 @@ use yii\db\ActiveRecord;
  * @property string|null $last_fetch_status
  * @property string|null $last_fetch_error
  * @property int $fetch_count
+ * @property array|null $credentials           JSONB: {login, password, token, api_key, headers, host, port, ...}
+ * @property string|null $next_run_at           Предвычисленное время следующего запуска
+ * @property int|null $last_duration_sec        Длительность последнего скачивания (сек)
+ * @property string|null $notes                 Заметки менеджера
  * @property string $created_at
  * @property string $updated_at
  *
@@ -46,9 +52,22 @@ use yii\db\ActiveRecord;
  */
 class SupplierFetchConfig extends ActiveRecord
 {
+    /** @var string[] Автоматизируемые методы (не manual) */
+    public const AUTO_METHODS = ['url', 'ftp', 'api'];
+
     public static function tableName(): string
     {
         return '{{%supplier_fetch_configs}}';
+    }
+
+    public function behaviors(): array
+    {
+        return [
+            [
+                'class' => TimestampBehavior::class,
+                'value' => new Expression('NOW()'),
+            ],
+        ];
     }
 
     public function rules(): array
@@ -65,7 +84,9 @@ class SupplierFetchConfig extends ActiveRecord
             [['schedule_cron'], 'string', 'max' => 100],
             [['file_pattern'], 'string', 'max' => 255],
             [['is_enabled', 'ftp_passive'], 'boolean'],
-            [['ftp_port', 'email_port', 'schedule_interval_hours', 'fetch_count'], 'integer'],
+            [['ftp_port', 'email_port', 'schedule_interval_hours', 'fetch_count', 'last_duration_sec'], 'integer'],
+            [['notes', 'last_fetch_error'], 'string'],
+            [['credentials'], 'safe'], // JSONB
         ];
     }
 
@@ -93,14 +114,27 @@ class SupplierFetchConfig extends ActiveRecord
             'file_pattern' => 'Паттерн файла',
             'last_fetch_at' => 'Последняя загрузка',
             'last_fetch_status' => 'Статус загрузки',
+            'last_fetch_error' => 'Ошибка',
+            'last_duration_sec' => 'Длительность (сек)',
             'fetch_count' => 'Кол-во загрузок',
+            'credentials' => 'Авторизация (JSONB)',
+            'next_run_at' => 'Следующий запуск',
+            'notes' => 'Заметки',
         ];
     }
+
+    // ═══════════════════════════════════════════
+    // Relations
+    // ═══════════════════════════════════════════
 
     public function getSupplier()
     {
         return $this->hasOne(Supplier::class, ['id' => 'supplier_id']);
     }
+
+    // ═══════════════════════════════════════════
+    // Helpers
+    // ═══════════════════════════════════════════
 
     /**
      * Метод получения в человеческом виде.
@@ -108,12 +142,96 @@ class SupplierFetchConfig extends ActiveRecord
     public function getMethodLabel(): string
     {
         return match ($this->fetch_method) {
-            'manual' => 'Ручная загрузка',
-            'url' => 'По ссылке',
-            'ftp' => 'FTP',
-            'email' => 'Email (IMAP)',
-            'api' => 'API',
-            default => $this->fetch_method,
+            'manual' => '📁 Ручная загрузка',
+            'url'    => '🌐 По ссылке (HTTP)',
+            'ftp'    => '📡 FTP',
+            'email'  => '📧 Email (IMAP)',
+            'api'    => '🔌 API',
+            default  => $this->fetch_method,
         };
+    }
+
+    /**
+     * Статус в человеческом виде.
+     */
+    public function getStatusLabel(): string
+    {
+        return match ($this->last_fetch_status) {
+            'success'    => '✅ Успешно',
+            'failed'     => '❌ Ошибка',
+            'running'    => '⏳ Выполняется',
+            'queued'     => '📋 В очереди',
+            null         => '—',
+            default      => $this->last_fetch_status,
+        };
+    }
+
+    /**
+     * Является ли конфиг автоматизируемым (не manual).
+     */
+    public function isAutomatable(): bool
+    {
+        return in_array($this->fetch_method, self::AUTO_METHODS, true);
+    }
+
+    /**
+     * Есть ли расписание (cron или интервал).
+     */
+    public function hasSchedule(): bool
+    {
+        return !empty($this->schedule_cron) || ($this->schedule_interval_hours > 0);
+    }
+
+    /**
+     * Получить URL источника (унифицировано).
+     */
+    public function getSourceUrl(): string
+    {
+        return match ($this->fetch_method) {
+            'url'  => $this->url ?? '',
+            'ftp'  => "ftp://{$this->ftp_host}:{$this->ftp_port}{$this->ftp_path}",
+            'api'  => $this->api_url ?? '',
+            default => '',
+        };
+    }
+
+    /**
+     * Записать результат скачивания.
+     */
+    public function recordFetchResult(bool $success, ?string $error = null, ?int $durationSec = null): void
+    {
+        $this->last_fetch_at = new Expression('NOW()');
+        $this->last_fetch_status = $success ? 'success' : 'failed';
+        $this->last_fetch_error = $error;
+        $this->last_duration_sec = $durationSec;
+
+        if ($success) {
+            $this->fetch_count = ($this->fetch_count ?? 0) + 1;
+        }
+
+        $this->save(false);
+    }
+
+    /**
+     * Рассчитать и записать next_run_at на основе cron-расписания.
+     */
+    public function calculateNextRun(): void
+    {
+        if (!empty($this->schedule_cron)) {
+            try {
+                $cron = new \Cron\CronExpression($this->schedule_cron);
+                $next = $cron->getNextRunDate();
+                $this->next_run_at = $next->format('Y-m-d H:i:s');
+            } catch (\Throwable $e) {
+                // Невалидное cron-выражение
+                $this->next_run_at = null;
+            }
+        } elseif ($this->schedule_interval_hours > 0) {
+            $lastFetch = $this->last_fetch_at ? strtotime($this->last_fetch_at) : time();
+            $nextTs = $lastFetch + ($this->schedule_interval_hours * 3600);
+            $this->next_run_at = date('Y-m-d H:i:s', max($nextTs, time()));
+        } else {
+            $this->next_run_at = null;
+        }
     }
 }
