@@ -11,6 +11,7 @@ use yii\db\ActiveRecord;
  * @property string $supplier_sku
  * @property float|null $price_min
  * @property float|null $price_max
+ * @property float|null $retail_price  Розничная цена = price_min + наценка (Sprint 11)
  * @property bool $in_stock
  * @property string $stock_status
  * @property int $variant_count
@@ -39,6 +40,7 @@ class SupplierOffer extends ActiveRecord
             'supplier_sku' => 'SKU',
             'price_min' => 'Цена от',
             'price_max' => 'Цена до',
+            'retail_price' => 'Розничная цена',
             'in_stock' => 'В наличии',
             'variant_count' => 'Варианты',
             'match_confidence' => 'Уверенность',

@@ -73,6 +73,11 @@ return [
             'class' => \common\services\GoldenRecordService::class,
         ],
 
+        // ═══ Pricing Engine — движок ценообразования (Sprint 11) ═══
+        'pricingService' => [
+            'class' => \common\services\PriceCalculationService::class,
+        ],
+
         // ═══ Catalog Persister — материализация DTO → MDM каталог ═══
         'catalogPersister' => [
             'class' => \common\services\CatalogPersisterService::class,

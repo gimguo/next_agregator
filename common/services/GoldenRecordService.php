@@ -23,6 +23,10 @@ class GoldenRecordService extends Component
 {
     /**
      * Пересчитать агрегаты reference_variant.
+     *
+     * Sprint 11: best_price теперь использует COALESCE(retail_price, price_min).
+     * Если для оффера рассчитана retail_price (наценка) — используем её.
+     * Иначе — fallback на price_min (цена поставщика).
      */
     public function recalculateVariant(int $variantId): void
     {
@@ -31,17 +35,17 @@ class GoldenRecordService extends Component
         $db->createCommand("
             UPDATE {{%reference_variants}} rv SET
                 best_price = (
-                    SELECT MIN(so.price_min)
+                    SELECT MIN(COALESCE(so.retail_price, so.price_min))
                     FROM {{%supplier_offers}} so
                     WHERE so.variant_id = rv.id AND so.is_active = true AND so.price_min > 0
                 ),
                 price_range_min = (
-                    SELECT MIN(so.price_min)
+                    SELECT MIN(COALESCE(so.retail_price, so.price_min))
                     FROM {{%supplier_offers}} so
                     WHERE so.variant_id = rv.id AND so.is_active = true AND so.price_min > 0
                 ),
                 price_range_max = (
-                    SELECT MAX(so.price_max)
+                    SELECT MAX(COALESCE(so.retail_price, so.price_max))
                     FROM {{%supplier_offers}} so
                     WHERE so.variant_id = rv.id AND so.is_active = true
                 ),

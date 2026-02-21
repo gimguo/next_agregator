@@ -45,6 +45,9 @@ class CatalogPersisterService extends Component
     /** @var MediaProcessingService */
     private MediaProcessingService $mediaService;
 
+    /** @var PriceCalculationService */
+    private PriceCalculationService $pricingService;
+
     /** @var array Статистика текущей сессии */
     private array $stats = [
         'models_created'   => 0,
@@ -64,6 +67,7 @@ class CatalogPersisterService extends Component
         $this->goldenRecord = Yii::$app->get('goldenRecord');
         $this->outbox = Yii::$app->get('outbox');
         $this->mediaService = Yii::$app->get('mediaService');
+        $this->pricingService = Yii::$app->get('pricingService');
     }
 
     /**
@@ -142,6 +146,20 @@ class CatalogPersisterService extends Component
             $this->stats['offers_updated']++;
         }
 
+        // ═══ PRICING ENGINE — расчёт розничной цены (Sprint 11) ═══
+        $offerId = $offerResult['offer_id'];
+        $pricingResult = $this->pricingService->updateOfferRetailPrice(
+            $offerId,
+            $dto->getMinPrice(),
+            [
+                'supplier_id'    => $supplierId,
+                'brand_id'       => $matchContext['brand_id'] ?? null,
+                'category_id'    => null, // будет определён ниже по модели
+                'product_family' => $matchContext['product_family'] ?? null,
+            ]
+        );
+        $retailPriceChanged = $pricingResult['changed'] ?? false;
+
         // ═══ GOLDEN RECORD — пересчёт агрегатов ═══
         $this->goldenRecord->recalculateVariant($variantId);
         $this->goldenRecord->recalculateModel($modelId);
@@ -151,8 +169,6 @@ class CatalogPersisterService extends Component
         $descUpdated = $this->goldenRecord->updateDescription($modelId, $dto->description, $dto->shortDescription);
 
         // ═══ OUTBOX — запись событий В ТОЙ ЖЕ ТРАНЗАКЦИИ ═══
-        $offerId = $offerResult['offer_id'];
-
         if ($isNewModel) {
             $this->outbox->modelCreated($modelId, $sessionId, [
                 'name'   => $dto->name,
@@ -174,15 +190,21 @@ class CatalogPersisterService extends Component
 
         if ($offerResult['is_new']) {
             $this->outbox->offerCreated($modelId, $variantId, $offerId, $sessionId, [
-                'price' => $dto->getMinPrice(),
-                'supplier_id' => $supplierId,
+                'price'        => $dto->getMinPrice(),
+                'retail_price' => $pricingResult['new_retail'] ?? null,
+                'supplier_id'  => $supplierId,
             ]);
         } else {
             // Оффер обновлён — проверяем изменение цены
-            if ($offerResult['price_changed'] ?? false) {
-                $this->outbox->priceChanged($modelId, $variantId, $offerId, [
-                    'old_price' => $offerResult['old_price'] ?? null,
-                    'new_price' => $dto->getMinPrice(),
+            $supplierPriceChanged = $offerResult['price_changed'] ?? false;
+
+            if ($supplierPriceChanged || $retailPriceChanged) {
+                // Если изменилась retail_price → price_updated Fast-Lane
+                $this->outbox->emitPriceUpdate($modelId, $variantId, $offerId, [
+                    'old_supplier_price' => $offerResult['old_price'] ?? null,
+                    'new_supplier_price' => $dto->getMinPrice(),
+                    'old_retail_price'   => $pricingResult['old_retail'] ?? null,
+                    'new_retail_price'   => $pricingResult['new_retail'] ?? null,
                 ], $sessionId);
             } else {
                 $this->outbox->offerUpdated($modelId, $variantId, $offerId, $sessionId);
