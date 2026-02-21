@@ -130,6 +130,11 @@ return [
             ],
         ],
 
+        // ═══ Variant Exploder — разложение вариантов по размерам (Sprint 16) ═══
+        'variantExploder' => [
+            'class' => \common\services\VariantExploderService::class,
+        ],
+
         // ═══ DAM — Digital Asset Management (S3/MinIO медиа-пайплайн) ═══
         'mediaService' => [
             'class' => \common\services\MediaProcessingService::class,

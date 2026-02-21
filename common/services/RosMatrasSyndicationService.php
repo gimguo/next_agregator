@@ -196,9 +196,13 @@ class RosMatrasSyndicationService extends Component
 
             $variantOffers = array_filter($allOffers, fn($o) => (int)$o['variant_id'] === $varId);
 
-            // Вариант активен, если есть хотя бы один активный оффер с наличием
+            // Вариант активен, если:
+            //   a) есть хотя бы один активный оффер с наличием, ИЛИ
+            //   b) у варианта best_price > 0 (установлена через VariantExploderService из variants_json)
+            // И при этом сам вариант помечен как is_in_stock
             $activeOffers = array_filter($variantOffers, fn($o) => (bool)$o['in_stock']);
-            $variantIsActive = !empty($activeOffers) && (bool)$variant['is_in_stock'];
+            $hasPriceData = ((float)($variant['best_price'] ?? 0)) > 0;
+            $variantIsActive = (bool)$variant['is_in_stock'] && (!empty($activeOffers) || $hasPriceData);
 
             $projectedVariants[] = [
                 'id'               => $varId,
