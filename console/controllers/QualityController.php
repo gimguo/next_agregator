@@ -4,6 +4,7 @@ namespace console\controllers;
 
 use common\dto\HealingResultDTO;
 use common\dto\ReadinessReportDTO;
+use common\jobs\HealModelJob;
 use common\models\ChannelRequirement;
 use common\models\ModelChannelReadiness;
 use common\models\SalesChannel;
@@ -27,9 +28,10 @@ use Yii;
  *   php yii quality/report --channel=rosmatras   # Отчёт по одному каналу
  *   php yii quality/check --model=123            # Проверить конкретную модель
  *   php yii quality/requirements                 # Показать требования каналов
- *   php yii quality/heal --channel=rosmatras     # AI-лечение неполных карточек
- *   php yii quality/heal --limit=50              # Лечить до 50 моделей
+ *   php yii quality/heal --channel=rosmatras     # Fan-out: раздать лечение в очередь
+ *   php yii quality/heal --limit=500             # Лимит моделей
  *   php yii quality/heal --dry-run               # Только показать, что будет лечиться
+ *   php yii quality/heal --sync                  # Синхронный режим (старое поведение)
  */
 class QualityController extends Controller
 {
@@ -48,13 +50,16 @@ class QualityController extends Controller
     /** @var bool Dry-run — показать что будет лечиться, не лечить */
     public bool $dryRun = false;
 
+    /** @var bool Синхронный режим (старое поведение: лечить в текущем процессе) */
+    public bool $sync = false;
+
     /** @var ReadinessScoringService */
     private ReadinessScoringService $readinessService;
 
     public function options($actionID): array
     {
         return array_merge(parent::options($actionID), [
-            'channel', 'model', 'top', 'limit', 'dryRun',
+            'channel', 'model', 'top', 'limit', 'dryRun', 'sync',
         ]);
     }
 
@@ -388,12 +393,17 @@ class QualityController extends Controller
     /**
      * AI-лечение неполных карточек товаров.
      *
-     * Выбирает модели с is_ready=false, у которых есть лечимые поля
-     * (описание, атрибуты) и вызывает AutoHealingService.
+     * По умолчанию — Fan-out: раздаёт HealModelJob в очередь для параллельного выполнения.
+     * С --sync — старое поведение: лечит последовательно в текущем процессе.
      *
-     * php yii quality/heal --channel=rosmatras
-     * php yii quality/heal --channel=rosmatras --limit=100
-     * php yii quality/heal --channel=rosmatras --dry-run
+     * php yii quality/heal --channel=rosmatras              # Fan-out (мгновенно!)
+     * php yii quality/heal --channel=rosmatras --limit=500  # 500 моделей в очередь
+     * php yii quality/heal --channel=rosmatras --dry-run    # Показать, не лечить
+     * php yii quality/heal --channel=rosmatras --sync       # Синхронный режим
+     *
+     * Для параллельного выполнения запустите несколько воркеров:
+     *   php yii queue/listen --verbose & php yii queue/listen --verbose &
+     *   Или через Supervisor: numprocs=5
      */
     public function actionHeal(): int
     {
@@ -408,7 +418,8 @@ class QualityController extends Controller
 
         $this->stdout("  Канал:     {$channel->name} ({$channel->driver})\n");
         $this->stdout("  Лимит:     {$this->limit} моделей\n");
-        $this->stdout("  Dry-run:   " . ($this->dryRun ? 'Да (только анализ)' : 'Нет (лечим!)') . "\n\n");
+        $mode = $this->dryRun ? 'Dry-run (только анализ)' : ($this->sync ? 'Синхронный (в текущем процессе)' : 'Fan-out (через очередь)');
+        $this->stdout("  Режим:     {$mode}\n\n");
 
         /** @var AutoHealingService $healer */
         $healer = Yii::$app->get('autoHealer');
@@ -423,40 +434,8 @@ class QualityController extends Controller
 
         $this->stdout("  AI модель: {$ai->model}\n\n");
 
-        // Выбираем кандидатов для лечения
-        $db = Yii::$app->db;
-
-        // Модели, которые:
-        //   1. is_ready = false
-        //   2. last_heal_attempt_at IS NULL ИЛИ старше 24ч
-        //   3. Имеют лечимые поля (не только image/barcode/price/brand)
-        $cooldownInterval = $healer->healCooldownSeconds;
-        $candidates = $db->createCommand("
-            SELECT mcr.model_id, mcr.score, mcr.missing_fields,
-                   pm.name AS model_name, pm.product_family,
-                   b.canonical_name AS brand_name
-            FROM {{%model_channel_readiness}} mcr
-            JOIN {{%product_models}} pm ON pm.id = mcr.model_id
-            LEFT JOIN {{%brands}} b ON b.id = pm.brand_id
-            WHERE mcr.channel_id = :cid
-              AND mcr.is_ready = false
-              AND (mcr.last_heal_attempt_at IS NULL OR mcr.last_heal_attempt_at < NOW() - INTERVAL '{$cooldownInterval} seconds')
-            ORDER BY mcr.score DESC, mcr.model_id
-            LIMIT :limit
-        ", [':cid' => $channel->id, ':limit' => $this->limit * 3])->queryAll(); // берём больше, потом фильтруем
-
-        // Фильтруем: оставляем только модели с лечимыми полями
-        $healableCandidates = [];
-        foreach ($candidates as $row) {
-            $missing = $this->parseJson($row['missing_fields']);
-            if ($healer->hasHealableFields($missing)) {
-                $healableCandidates[] = array_merge($row, ['missing' => $missing]);
-            }
-            if (count($healableCandidates) >= $this->limit) {
-                break;
-            }
-        }
-
+        // ═══ Выбираем кандидатов ═══
+        $healableCandidates = $this->findHealCandidates($channel, $healer);
         $totalCandidates = count($healableCandidates);
 
         if ($totalCandidates === 0) {
@@ -466,33 +445,68 @@ class QualityController extends Controller
 
         $this->stdout("  Найдено кандидатов: {$totalCandidates}\n");
 
-        // Dry-run: только показываем список
+        // ═══ Dry-run ═══
         if ($this->dryRun) {
-            $this->stdout("\n  ── Кандидаты для лечения (dry-run) ──\n\n", Console::FG_YELLOW);
-            $this->stdout(sprintf("  %-6s %-40s %-12s %s\n", 'ID', 'Название', 'Скор', 'Чего не хватает'), Console::BOLD);
-            $this->stdout("  " . str_repeat('─', 90) . "\n");
-
-            foreach ($healableCandidates as $row) {
-                $healableFields = array_filter($row['missing'], fn($f) => !$this->isUnhealableField($f));
-                $fieldsStr = implode(', ', array_map(fn($f) => ReadinessReportDTO::labelFor($f), array_slice($healableFields, 0, 3)));
-                if (count($healableFields) > 3) {
-                    $fieldsStr .= ' +' . (count($healableFields) - 3);
-                }
-
-                $this->stdout(sprintf(
-                    "  %-6d %-40s %3d%%        %s\n",
-                    (int)$row['model_id'],
-                    mb_substr($row['model_name'], 0, 38),
-                    (int)$row['score'],
-                    $fieldsStr
-                ));
-            }
-
-            $this->stdout("\n  Для запуска лечения уберите --dry-run\n\n");
-            return ExitCode::OK;
+            return $this->printDryRun($healableCandidates);
         }
 
-        // ═══ РЕАЛЬНОЕ ЛЕЧЕНИЕ ═══
+        // ═══ Синхронный режим (--sync) ═══
+        if ($this->sync) {
+            return $this->healSync($healableCandidates, $channel, $healer);
+        }
+
+        // ═══ Fan-out: раздаём HealModelJob в очередь ═══
+        return $this->healFanOut($healableCandidates, $channel);
+    }
+
+    /**
+     * Fan-out: раздать HealModelJob в очередь для параллельного выполнения.
+     */
+    private function healFanOut(array $candidates, SalesChannel $channel): int
+    {
+        $this->stdout("\n  Раздаём задачи в очередь...\n\n");
+
+        $pushed = 0;
+        foreach ($candidates as $row) {
+            Yii::$app->queue->push(new HealModelJob([
+                'modelId'       => (int)$row['model_id'],
+                'channelId'     => $channel->id,
+                'missingFields' => $row['missing'],
+            ]));
+            $pushed++;
+        }
+
+        $this->stdout("  ╔══════════════════════════════════════════════════════════════╗\n", Console::FG_GREEN);
+        $this->stdout("  ║  FAN-OUT ЗАВЕРШЁН                                           ║\n", Console::FG_GREEN);
+        $this->stdout("  ╚══════════════════════════════════════════════════════════════╝\n\n", Console::FG_GREEN);
+
+        $this->stdout("  В очередь на лечение добавлено: ");
+        $this->stdout("{$pushed} моделей\n\n", Console::FG_GREEN, Console::BOLD);
+
+        $this->stdout("  Для параллельного выполнения запустите воркеры:\n\n", Console::BOLD);
+        $this->stdout("    # Один воркер:\n");
+        $this->stdout("    php yii queue/listen --verbose\n\n");
+        $this->stdout("    # 5 параллельных воркеров:\n");
+        $this->stdout("    for i in \$(seq 1 5); do php yii queue/listen --verbose & done\n\n");
+        $this->stdout("    # Через Supervisor (рекомендуется):\n");
+        $this->stdout("    [program:heal-worker]\n");
+        $this->stdout("    command=php /app/yii queue/listen --verbose\n");
+        $this->stdout("    numprocs=5\n");
+        $this->stdout("    process_name=%(program_name)s_%(process_num)02d\n\n");
+
+        $this->stdout("  Мониторинг:\n");
+        $this->stdout("    php yii queue/info\n\n");
+
+        return ExitCode::OK;
+    }
+
+    /**
+     * Синхронный режим лечения (старое поведение).
+     */
+    private function healSync(array $candidates, SalesChannel $channel, AutoHealingService $healer): int
+    {
+        $totalCandidates = count($candidates);
+
         $this->stdout("\n");
         Console::startProgress(0, $totalCandidates, '  Лечим: ');
 
@@ -502,7 +516,7 @@ class QualityController extends Controller
         $skipped = 0;
         $errors = [];
 
-        foreach ($healableCandidates as $i => $row) {
+        foreach ($candidates as $i => $row) {
             $modelId = (int)$row['model_id'];
 
             try {
@@ -521,16 +535,34 @@ class QualityController extends Controller
                         $skipped++;
                     }
                 }
+            } catch (\common\exceptions\AiRateLimitException $e) {
+                // Rate Limit — ждём и продолжаем
+                $this->stderr("\n  ⏳ Rate Limit (HTTP {$e->httpCode}), пауза {$e->retryAfterSec}s...\n", Console::FG_YELLOW);
+                sleep($e->retryAfterSec);
+
+                // Повторяем текущую модель
+                try {
+                    $result = $healer->healModel($modelId, $row['missing'], $channel);
+                    if ($result->success) {
+                        $healed++;
+                        if ($result->isFullyHealed()) {
+                            $pushed++;
+                        }
+                    } else {
+                        $failed++;
+                    }
+                } catch (\Throwable $retryEx) {
+                    $failed++;
+                    $errors[] = "#{$modelId}: Retry failed — {$retryEx->getMessage()}";
+                }
             } catch (\Throwable $e) {
                 $failed++;
                 $errors[] = "#{$modelId}: Exception — {$e->getMessage()}";
                 Yii::error("AutoHealing exception model_id={$modelId}: {$e->getMessage()}", 'ai.healing');
 
-                // Если API упал — прерываем, чтобы не тратить лимит
+                // Если API упал — прерываем
                 if (stripos($e->getMessage(), 'cURL error') !== false
-                    || stripos($e->getMessage(), 'Connection') !== false
-                    || stripos($e->getMessage(), '429') !== false
-                    || stripos($e->getMessage(), '503') !== false) {
+                    || stripos($e->getMessage(), 'Connection') !== false) {
                     Console::endProgress();
                     $this->stderr("\n\n  ⚠️  API недоступен, прерываем лечение.\n", Console::FG_RED);
                     $this->stderr("  Ошибка: {$e->getMessage()}\n\n", Console::FG_RED);
@@ -545,7 +577,7 @@ class QualityController extends Controller
 
         // ═══ ИТОГИ ═══
         $this->stdout("\n  ╔══════════════════════════════════════════════════════════════╗\n", Console::FG_GREEN);
-        $this->stdout("  ║  РЕЗУЛЬТАТЫ ЛЕЧЕНИЯ                                        ║\n", Console::FG_GREEN);
+        $this->stdout("  ║  РЕЗУЛЬТАТЫ ЛЕЧЕНИЯ (синхронный режим)                      ║\n", Console::FG_GREEN);
         $this->stdout("  ╚══════════════════════════════════════════════════════════════╝\n\n", Console::FG_GREEN);
 
         $this->stdout("  Обработано:       {$totalCandidates}\n");
@@ -685,6 +717,73 @@ class QualityController extends Controller
     // ═══════════════════════════════════════════
     // HELPERS
     // ═══════════════════════════════════════════
+
+    /**
+     * Найти кандидатов для AI-лечения.
+     *
+     * @return array [['model_id', 'score', 'missing_fields', 'model_name', 'brand_name', 'missing' => [...]]]
+     */
+    private function findHealCandidates(SalesChannel $channel, AutoHealingService $healer): array
+    {
+        $db = Yii::$app->db;
+        $cooldownInterval = $healer->healCooldownSeconds;
+
+        $candidates = $db->createCommand("
+            SELECT mcr.model_id, mcr.score, mcr.missing_fields,
+                   pm.name AS model_name, pm.product_family,
+                   b.canonical_name AS brand_name
+            FROM {{%model_channel_readiness}} mcr
+            JOIN {{%product_models}} pm ON pm.id = mcr.model_id
+            LEFT JOIN {{%brands}} b ON b.id = pm.brand_id
+            WHERE mcr.channel_id = :cid
+              AND mcr.is_ready = false
+              AND (mcr.last_heal_attempt_at IS NULL OR mcr.last_heal_attempt_at < NOW() - INTERVAL '{$cooldownInterval} seconds')
+            ORDER BY mcr.score DESC, mcr.model_id
+            LIMIT :limit
+        ", [':cid' => $channel->id, ':limit' => $this->limit * 3])->queryAll();
+
+        $healableCandidates = [];
+        foreach ($candidates as $row) {
+            $missing = $this->parseJson($row['missing_fields']);
+            if ($healer->hasHealableFields($missing)) {
+                $healableCandidates[] = array_merge($row, ['missing' => $missing]);
+            }
+            if (count($healableCandidates) >= $this->limit) {
+                break;
+            }
+        }
+
+        return $healableCandidates;
+    }
+
+    /**
+     * Dry-run: показать кандидатов, не лечить.
+     */
+    private function printDryRun(array $candidates): int
+    {
+        $this->stdout("\n  ── Кандидаты для лечения (dry-run) ──\n\n", Console::FG_YELLOW);
+        $this->stdout(sprintf("  %-6s %-40s %-12s %s\n", 'ID', 'Название', 'Скор', 'Чего не хватает'), Console::BOLD);
+        $this->stdout("  " . str_repeat('─', 90) . "\n");
+
+        foreach ($candidates as $row) {
+            $healableFields = array_filter($row['missing'], fn($f) => !$this->isUnhealableField($f));
+            $fieldsStr = implode(', ', array_map(fn($f) => ReadinessReportDTO::labelFor($f), array_slice($healableFields, 0, 3)));
+            if (count($healableFields) > 3) {
+                $fieldsStr .= ' +' . (count($healableFields) - 3);
+            }
+
+            $this->stdout(sprintf(
+                "  %-6d %-40s %3d%%        %s\n",
+                (int)$row['model_id'],
+                mb_substr($row['model_name'], 0, 38),
+                (int)$row['score'],
+                $fieldsStr
+            ));
+        }
+
+        $this->stdout("\n  Для запуска лечения уберите --dry-run\n\n");
+        return ExitCode::OK;
+    }
 
     /**
      * Резолвить канал по --channel (driver name или ID).

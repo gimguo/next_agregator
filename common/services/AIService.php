@@ -3,6 +3,7 @@
 namespace common\services;
 
 use common\enums\ProductFamily;
+use common\exceptions\AiRateLimitException;
 use GuzzleHttp\Client as HttpClient;
 use GuzzleHttp\Exception\RequestException;
 use yii\base\Component;
@@ -971,12 +972,52 @@ PROMPT;
             return $content;
 
         } catch (RequestException $e) {
-            Yii::error('AI: ошибка запроса — ' . $e->getMessage(), 'ai');
+            $statusCode = $e->hasResponse() ? $e->getResponse()->getStatusCode() : 0;
+
+            // 429 (Rate Limit), 502/503 (перегрузка DeepSeek) — временные ошибки,
+            // пробрасываем AiRateLimitException чтобы HealModelJob мог повторить
+            if (in_array($statusCode, [429, 502, 503], true)) {
+                $retryAfter = $this->parseRetryAfter($e);
+                Yii::warning("AI: Rate Limit / Backend Error (HTTP {$statusCode}), retry after {$retryAfter}s", 'ai');
+                throw new AiRateLimitException($statusCode, $retryAfter, '', $e);
+            }
+
+            Yii::error('AI: ошибка запроса (HTTP ' . $statusCode . ') — ' . $e->getMessage(), 'ai');
             return '{}';
+        } catch (AiRateLimitException $e) {
+            throw $e; // Пробрасываем наверх без подавления
         } catch (\Throwable $e) {
             Yii::error('AI: неизвестная ошибка — ' . $e->getMessage(), 'ai');
             return '{}';
         }
+    }
+
+    /**
+     * Парсинг заголовка Retry-After из ответа 429.
+     */
+    private function parseRetryAfter(RequestException $e): int
+    {
+        $default = 15;
+        if (!$e->hasResponse()) {
+            return $default;
+        }
+
+        $retryHeader = $e->getResponse()->getHeaderLine('Retry-After');
+        if (!empty($retryHeader)) {
+            $seconds = (int)$retryHeader;
+            return $seconds > 0 ? min($seconds, 120) : $default;
+        }
+
+        // OpenRouter может возвращать JSON с x-ratelimit-reset
+        $resetHeader = $e->getResponse()->getHeaderLine('x-ratelimit-reset');
+        if (!empty($resetHeader)) {
+            $resetTime = (int)$resetHeader;
+            if ($resetTime > time()) {
+                return min($resetTime - time(), 120);
+            }
+        }
+
+        return $default;
     }
 
     /**
