@@ -54,8 +54,10 @@ class AIService extends Component
             $this->baseUrl = $params['openrouter']['baseUrl'] ?? 'https://openrouter.ai/api/v1';
         }
 
+        // Trailing slash обязателен для корректного resolve относительных путей в Guzzle
+        $baseUri = rtrim($this->baseUrl, '/') . '/';
         $this->httpClient = new HttpClient([
-            'base_uri' => $this->baseUrl,
+            'base_uri' => $baseUri,
             'timeout' => 60,
             'headers' => [
                 'Authorization' => "Bearer {$this->apiKey}",
@@ -928,7 +930,7 @@ PROMPT;
         try {
             $startTime = microtime(true);
 
-            $response = $this->httpClient->post('/chat/completions', [
+            $response = $this->httpClient->post('chat/completions', [
                 'json' => [
                     'model' => $this->model,
                     'messages' => [
