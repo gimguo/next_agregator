@@ -3,6 +3,7 @@
 namespace backend\controllers;
 
 use backend\models\ProductModelSearch;
+use common\enums\ProductFamily;
 use common\models\MediaAsset;
 use common\models\ModelChannelReadiness;
 use common\models\ModelDataSource;
@@ -13,6 +14,7 @@ use common\models\SupplierOffer;
 use common\services\AutoHealingService;
 use common\services\GoldenRecordService;
 use common\services\OutboxService;
+use common\services\ProductFamilySchema;
 use common\services\ReadinessScoringService;
 use common\services\RosMatrasSyndicationService;
 use common\services\marketplace\MarketplaceApiClientInterface;
@@ -22,16 +24,18 @@ use yii\filters\AccessControl;
 use yii\filters\VerbFilter;
 use yii\web\Controller;
 use yii\web\NotFoundHttpException;
+use yii\web\Response;
 use Yii;
 
 /**
  * Sprint 15 — PIM Cockpit: MDM Каталог с Manual Override и AI Healing.
  *
  * Пульт управления карточками товаров:
- *   - actionView: детальная карточка с Readiness, Pricing, AI Heal
- *   - actionUpdate: ручное редактирование с Manual Override (priority=100)
- *   - actionHeal: принудительное AI-лечение из админки
- *   - actionSync: ручная синхронизация на витрину
+ *   - actionView:     детальная карточка с Readiness, Pricing, AI Heal
+ *   - actionUpdate:   ручное редактирование с Manual Override (priority=100)
+ *   - actionHeal:     принудительное AI-лечение (POST redirect)
+ *   - actionHealAjax: принудительное AI-лечение (Ajax/Pjax, JSON)
+ *   - actionSync:     ручная синхронизация на витрину
  */
 class CatalogController extends Controller
 {
@@ -47,168 +51,175 @@ class CatalogController extends Controller
             'verbs' => [
                 'class' => VerbFilter::class,
                 'actions' => [
-                    'sync' => ['post'],
-                    'heal' => ['post'],
+                    'sync'      => ['post'],
+                    'heal'      => ['post'],
+                    'heal-ajax' => ['post'],
                 ],
             ],
         ];
     }
 
-    /**
-     * Список всех моделей товаров.
-     */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * INDEX
+     * ═══════════════════════════════════════════════════════════════════ */
+
     public function actionIndex(): string
     {
         $searchModel = new ProductModelSearch();
         $dataProvider = $searchModel->search(Yii::$app->request->queryParams);
 
         return $this->render('index', [
-            'searchModel' => $searchModel,
+            'searchModel'  => $searchModel,
             'dataProvider' => $dataProvider,
         ]);
     }
 
-    /**
-     * PIM Cockpit: детальная карточка модели.
-     *
-     * Отображает:
-     *   - Readiness Score + missing fields
-     *   - Основные данные (описание, атрибуты)
-     *   - Изображения
-     *   - Варианты с ценообразованием (base_price / retail_price)
-     *   - Источники данных (model_data_sources)
-     *   - Кнопки: Редактировать, AI Heal, Sync
-     */
+    /* ═══════════════════════════════════════════════════════════════════════
+     * VIEW — PIM Cockpit
+     * ═══════════════════════════════════════════════════════════════════ */
+
     public function actionView(int $id): string
     {
-        $model = $this->findModel($id);
-
-        // Readiness
+        $model   = $this->findModel($id);
         $channel = SalesChannel::find()->where(['is_active' => true])->one();
+
+        // ── Readiness ──────────────────────────────────────────
         $readiness = null;
-        $readinessReport = null;
         if ($channel) {
             $readiness = ModelChannelReadiness::findOne([
-                'model_id' => $id,
+                'model_id'   => $id,
                 'channel_id' => $channel->id,
             ]);
-            // Live evaluate if no cache
             if (!$readiness) {
                 try {
                     /** @var ReadinessScoringService $scorer */
                     $scorer = Yii::$app->get('readinessService');
-                    $readinessReport = $scorer->evaluate($id, $channel, true);
+                    $scorer->evaluate($id, $channel, true);
                     $readiness = ModelChannelReadiness::findOne([
-                        'model_id' => $id,
+                        'model_id'   => $id,
                         'channel_id' => $channel->id,
                     ]);
                 } catch (\Throwable $e) {
-                    Yii::warning("CatalogView: readiness eval failed for model #{$id}: {$e->getMessage()}", 'catalog');
+                    Yii::warning("CatalogView: readiness eval failed #{$id}: {$e->getMessage()}", 'catalog');
                 }
             }
         }
 
-        // Изображения модели
+        // ── Images ─────────────────────────────────────────────
         $images = MediaAsset::find()
             ->where(['entity_type' => 'model', 'entity_id' => $id])
             ->orderBy(['is_primary' => SORT_DESC, 'sort_order' => SORT_ASC])
             ->all();
 
-        // Варианты с офферами (включая retail_price)
-        $variants = ReferenceVariant::find()
+        // ── Variants + Offers ──────────────────────────────────
+        $variants   = ReferenceVariant::find()
             ->where(['model_id' => $id])
             ->orderBy(['sort_order' => SORT_ASC, 'variant_label' => SORT_ASC])
             ->all();
 
         $variantIds = array_map(fn($v) => $v->id, $variants);
-        $offers = [];
-        if (!empty($variantIds)) {
-            $allOffers = SupplierOffer::find()
+        $offers     = [];
+        if ($variantIds) {
+            $all = SupplierOffer::find()
                 ->where(['variant_id' => $variantIds])
                 ->with('supplier')
                 ->orderBy(['variant_id' => SORT_ASC, 'price_min' => SORT_ASC])
                 ->all();
-            foreach ($allOffers as $offer) {
-                $offers[$offer->variant_id][] = $offer;
+            foreach ($all as $o) {
+                $offers[$o->variant_id][] = $o;
             }
         }
-
-        // Офферы без варианта
         $orphanOffers = SupplierOffer::find()
             ->where(['model_id' => $id, 'variant_id' => null])
             ->with('supplier')
             ->all();
 
-        // Источники данных (model_data_sources)
+        // ── Data Sources ───────────────────────────────────────
         $dataSources = ModelDataSource::find()
             ->where(['model_id' => $id])
             ->orderBy(['priority' => SORT_DESC, 'updated_at' => SORT_DESC])
             ->all();
 
+        // ── Attribute schema ───────────────────────────────────
+        $family = $model->product_family
+            ? (ProductFamily::tryFrom($model->product_family) ?? ProductFamily::UNKNOWN)
+            : ProductFamily::UNKNOWN;
+        $familySchema = ProductFamilySchema::getSchema($family);
+
+        // ── Per-attribute source map ───────────────────────────
+        // Determine which source provided each attribute (highest priority wins)
+        $attrSourceMap  = self::buildAttrSourceMap($dataSources);
+        $descSource     = self::resolveFieldSource($dataSources, 'description');
+
         return $this->render('view', [
-            'model' => $model,
-            'images' => $images,
-            'variants' => $variants,
-            'offers' => $offers,
-            'orphanOffers' => $orphanOffers,
-            'readiness' => $readiness,
-            'channel' => $channel,
-            'dataSources' => $dataSources,
+            'model'         => $model,
+            'images'        => $images,
+            'variants'      => $variants,
+            'offers'        => $offers,
+            'orphanOffers'  => $orphanOffers,
+            'readiness'     => $readiness,
+            'channel'       => $channel,
+            'dataSources'   => $dataSources,
+            'familySchema'  => $familySchema,
+            'attrSourceMap' => $attrSourceMap,
+            'descSource'    => $descSource,
         ]);
     }
 
-    /**
-     * Manual Override: редактирование карточки менеджером.
-     *
-     * При сохранении:
-     *   1. Записывает изменения в model_data_sources (source_type=manual_override, priority=100)
-     *   2. Применяет merged данные из всех источников к ProductModel
-     *   3. Пересчитывает GoldenRecord агрегаты
-     *   4. Пересчитывает ReadinessScore
-     *   5. Если 100% — emitContentUpdate() → Outbox
-     */
-    public function actionUpdate(int $id): string|\yii\web\Response
+    /* ═══════════════════════════════════════════════════════════════════════
+     * UPDATE — Manual Override
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    public function actionUpdate(int $id): string|Response
     {
         $model = $this->findModel($id);
 
         // Текущие атрибуты
-        $currentAttrs = [];
-        if (!empty($model->canonical_attributes)) {
-            $currentAttrs = is_string($model->canonical_attributes)
-                ? (json_decode($model->canonical_attributes, true) ?: [])
-                : (is_array($model->canonical_attributes) ? $model->canonical_attributes : []);
-        }
+        $currentAttrs = self::parseJsonAttrs($model->canonical_attributes);
 
-        // Загружаем manual_override если есть
+        // manual_override данные
         $manualSource = ModelDataSource::findOne([
-            'model_id' => $id,
+            'model_id'    => $id,
             'source_type' => ModelDataSource::SOURCE_MANUAL,
-            'source_id' => 'admin',
+            'source_id'   => 'admin',
         ]);
         $manualData = $manualSource ? $manualSource->getDataArray() : [];
 
+        // All sources for attribute-level badge
+        $allSources = ModelDataSource::find()
+            ->where(['model_id' => $id])
+            ->orderBy(['priority' => SORT_DESC])
+            ->all();
+        $attrSourceMap = self::buildAttrSourceMap($allSources);
+
+        // Schema
+        $family = $model->product_family
+            ? (ProductFamily::tryFrom($model->product_family) ?? ProductFamily::UNKNOWN)
+            : ProductFamily::UNKNOWN;
+        $familySchema = ProductFamilySchema::getSchema($family);
+
+        // ── POST: save ─────────────────────────────────────────
         if (Yii::$app->request->isPost) {
             $post = Yii::$app->request->post();
 
-            // Собираем данные из формы
             $overrideData = [];
-            $changes = [];
+            $changes      = [];
 
-            // Описание
-            $newDescription = trim($post['description'] ?? '');
-            if ($newDescription !== '' && $newDescription !== ($model->description ?? '')) {
-                $overrideData['description'] = $newDescription;
+            // Description
+            $newDesc = trim($post['description'] ?? '');
+            if ($newDesc !== '' && $newDesc !== ($model->description ?? '')) {
+                $overrideData['description'] = $newDesc;
                 $changes[] = 'описание';
             }
 
-            // Краткое описание
-            $newShortDesc = trim($post['short_description'] ?? '');
-            if ($newShortDesc !== '' && $newShortDesc !== ($model->short_description ?? '')) {
-                $overrideData['short_description'] = $newShortDesc;
+            // Short description
+            $newShort = trim($post['short_description'] ?? '');
+            if ($newShort !== '' && $newShort !== ($model->short_description ?? '')) {
+                $overrideData['short_description'] = $newShort;
                 $changes[] = 'краткое описание';
             }
 
-            // Атрибуты (из формы приходят как key=value пары)
+            // Attributes (schema-based inputs)
             $newAttrs = [];
             $attrKeys = $post['attr_key'] ?? [];
             $attrVals = $post['attr_value'] ?? [];
@@ -220,30 +231,28 @@ class CatalogController extends Controller
                 }
             }
 
-            if (!empty($newAttrs)) {
-                // Вычисляем diff: только реально изменённые/новые атрибуты
+            if ($newAttrs) {
                 $attrDiff = [];
                 foreach ($newAttrs as $k => $v) {
                     if (!isset($currentAttrs[$k]) || (string)$currentAttrs[$k] !== (string)$v) {
                         $attrDiff[$k] = $v;
                     }
                 }
-                if (!empty($attrDiff)) {
-                    $overrideData['attributes'] = $newAttrs; // Сохраняем полный набор из формы
+                if ($attrDiff) {
+                    $overrideData['attributes'] = $newAttrs;
                     $changes[] = count($attrDiff) . ' атрибут(ов)';
                 }
             }
 
-            if (empty($overrideData) && empty($changes)) {
+            if (!$overrideData && !$changes) {
                 Yii::$app->session->setFlash('info', 'Нет изменений для сохранения.');
                 return $this->redirect(['view', 'id' => $id]);
             }
 
             $db = Yii::$app->db;
-            $transaction = $db->beginTransaction();
-
+            $tx = $db->beginTransaction();
             try {
-                // ═══ 1. Записываем в model_data_sources (Manual Override, priority=100) ═══
+                // 1. model_data_sources
                 $userId = Yii::$app->user->id ?? null;
                 ModelDataSource::upsert(
                     $id,
@@ -255,90 +264,87 @@ class CatalogController extends Controller
                     $userId
                 );
 
-                // ═══ 2. Применяем данные к ProductModel ═══
-                $updateFields = [];
-
+                // 2. Apply to ProductModel
+                $upd = [];
                 if (isset($overrideData['description'])) {
-                    $updateFields['description'] = $overrideData['description'];
+                    $upd['description'] = $overrideData['description'];
                 }
                 if (isset($overrideData['short_description'])) {
-                    $updateFields['short_description'] = $overrideData['short_description'];
+                    $upd['short_description'] = $overrideData['short_description'];
                 }
                 if (isset($overrideData['attributes'])) {
-                    // Мержим: manual attrs перекрывают существующие
-                    $mergedAttrs = array_merge($currentAttrs, $overrideData['attributes']);
-                    $updateFields['canonical_attributes'] = new JsonExpression($mergedAttrs);
+                    $upd['canonical_attributes'] = new JsonExpression(
+                        array_merge($currentAttrs, $overrideData['attributes'])
+                    );
+                }
+                if ($upd) {
+                    $upd['updated_at'] = new \yii\db\Expression('NOW()');
+                    $db->createCommand()->update('{{%product_models}}', $upd, ['id' => $id])->execute();
                 }
 
-                if (!empty($updateFields)) {
-                    $updateFields['updated_at'] = new \yii\db\Expression('NOW()');
-                    $db->createCommand()->update('{{%product_models}}', $updateFields, ['id' => $id])->execute();
-                }
-
-                // ═══ 3. Пересчитываем Golden Record агрегаты ═══
+                // 3. Golden Record
                 /** @var GoldenRecordService $gr */
                 $gr = Yii::$app->get('goldenRecord');
                 $gr->recalculateModel($id);
 
-                // ═══ 4. Пересчитываем Readiness Score ═══
+                // 4. Readiness
                 $channel = SalesChannel::find()->where(['is_active' => true])->one();
-                $readinessResult = null;
+                $rr      = null;
                 if ($channel) {
                     /** @var ReadinessScoringService $scorer */
                     $scorer = Yii::$app->get('readinessService');
                     $scorer->resetCache();
-                    $readinessResult = $scorer->evaluate($id, $channel, true);
+                    $rr = $scorer->evaluate($id, $channel, true);
 
-                    // ═══ 5. Если 100% — пушим в Outbox ═══
-                    if ($readinessResult->isReady) {
+                    // 5. Outbox if ready
+                    if ($rr->isReady) {
                         try {
                             /** @var OutboxService $outbox */
                             $outbox = Yii::$app->get('outbox');
-                            $originalGate = $outbox->readinessGate;
-                            $outbox->readinessGate = false; // Мы уже проверили
+                            $gate = $outbox->readinessGate;
+                            $outbox->readinessGate = false;
                             $outbox->emitContentUpdate($id, null, ['source' => 'manual_override']);
-                            $outbox->readinessGate = $originalGate;
+                            $outbox->readinessGate = $gate;
                         } catch (\Throwable $e) {
-                            Yii::warning("ManualOverride: outbox push failed for model #{$id}: {$e->getMessage()}", 'catalog');
+                            Yii::warning("ManualOverride outbox #{$id}: {$e->getMessage()}", 'catalog');
                         }
                     }
                 }
 
-                $transaction->commit();
+                $tx->commit();
 
-                $changesList = implode(', ', $changes);
-                $readinessMsg = $readinessResult
-                    ? " Readiness: {$readinessResult->score}%"
-                        . ($readinessResult->isReady ? ' ✓ → Outbox' : '')
-                    : '';
-
-                Yii::$app->session->setFlash('success',
-                    "✓ Сохранено (Manual Override, priority=100): {$changesList}.{$readinessMsg}"
-                );
-
+                $msg = '✓ Manual Override (P:100): ' . implode(', ', $changes) . '.';
+                if ($rr) {
+                    $msg .= " Readiness: {$rr->score}%";
+                    $msg .= $rr->isReady ? ' → Outbox ✓' : '';
+                }
+                Yii::$app->session->setFlash('success', $msg);
             } catch (\Throwable $e) {
-                $transaction->rollBack();
-                Yii::error("ManualOverride error model #{$id}: {$e->getMessage()}", 'catalog');
-                Yii::$app->session->setFlash('error', "Ошибка сохранения: {$e->getMessage()}");
+                $tx->rollBack();
+                Yii::error("ManualOverride #{$id}: {$e->getMessage()}", 'catalog');
+                Yii::$app->session->setFlash('error', "Ошибка: {$e->getMessage()}");
             }
 
             return $this->redirect(['view', 'id' => $id]);
         }
 
-        // GET: показываем форму
+        // GET
         return $this->render('update', [
-            'model' => $model,
-            'currentAttrs' => $currentAttrs,
-            'manualData' => $manualData,
+            'model'         => $model,
+            'currentAttrs'  => $currentAttrs,
+            'manualData'    => $manualData,
+            'familySchema'  => $familySchema,
+            'attrSourceMap' => $attrSourceMap,
         ]);
     }
 
-    /**
-     * Принудительное AI-лечение из админки (синхронное).
-     */
-    public function actionHeal(int $id): \yii\web\Response
+    /* ═══════════════════════════════════════════════════════════════════════
+     * HEAL (POST redirect) — AI лечение
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    public function actionHeal(int $id): Response
     {
-        $model = $this->findModel($id);
+        $model   = $this->findModel($id);
         $channel = SalesChannel::find()->where(['is_active' => true])->one();
 
         if (!$channel) {
@@ -346,52 +352,127 @@ class CatalogController extends Controller
             return $this->redirect(['view', 'id' => $id]);
         }
 
-        // Получаем missing fields
         $readiness = ModelChannelReadiness::findOne([
-            'model_id' => $id,
+            'model_id'   => $id,
             'channel_id' => $channel->id,
         ]);
-
         if (!$readiness || $readiness->is_ready) {
-            Yii::$app->session->setFlash('info', 'Модель уже готова или нет данных readiness. Запустите quality/scan.');
+            Yii::$app->session->setFlash('info', 'Модель уже готова или нет данных readiness.');
             return $this->redirect(['view', 'id' => $id]);
         }
 
-        $missingFields = $readiness->getMissingList();
-        if (empty($missingFields)) {
-            Yii::$app->session->setFlash('info', 'Нет пропущенных полей для лечения.');
+        $missing = $readiness->getMissingList();
+        if (!$missing) {
+            Yii::$app->session->setFlash('info', 'Нет пропущенных полей.');
             return $this->redirect(['view', 'id' => $id]);
         }
 
         try {
             /** @var AutoHealingService $healer */
             $healer = Yii::$app->get('autoHealer');
-            $result = $healer->healModel($id, $missingFields, $channel);
+            $result = $healer->healModel($id, $missing, $channel);
 
             if ($result->success) {
-                $healedList = implode(', ', $result->healedFields);
-                $scoreMsg = "Score: {$result->newScore}%";
-                $outboxMsg = $result->newIsReady ? ' → Outbox ✓' : '';
-
+                $list  = implode(', ', $result->healedFields);
+                $extra = $result->newIsReady ? " → Outbox ✓" : '';
                 Yii::$app->session->setFlash('success',
-                    "🧬 AI вылечил: {$healedList}. {$scoreMsg}{$outboxMsg}"
-                );
+                    "🧬 AI вылечил: {$list}. Score: {$result->newScore}%{$extra}");
             } else {
-                $errors = implode('; ', $result->errors);
-                Yii::$app->session->setFlash('warning', "AI не смог вылечить: {$errors}");
+                Yii::$app->session->setFlash('warning',
+                    'AI не смог вылечить: ' . implode('; ', $result->errors));
             }
         } catch (\Throwable $e) {
-            Yii::error("AI Heal from admin, model #{$id}: {$e->getMessage()}", 'catalog');
+            Yii::error("AI Heal #{$id}: {$e->getMessage()}", 'catalog');
             Yii::$app->session->setFlash('error', "Ошибка AI: {$e->getMessage()}");
         }
 
         return $this->redirect(['view', 'id' => $id]);
     }
 
-    /**
-     * Принудительная синхронизация модели на витрину.
-     */
-    public function actionSync(int $id): \yii\web\Response
+    /* ═══════════════════════════════════════════════════════════════════════
+     * HEAL-AJAX — AI лечение через Ajax/Pjax (JSON response)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    public function actionHealAjax(int $id): array
+    {
+        Yii::$app->response->format = Response::FORMAT_JSON;
+
+        $model   = $this->findModel($id);
+        $channel = SalesChannel::find()->where(['is_active' => true])->one();
+
+        if (!$channel) {
+            return ['success' => false, 'message' => 'Нет активного канала продаж.'];
+        }
+
+        // Evaluate readiness fresh
+        /** @var ReadinessScoringService $scorer */
+        $scorer = Yii::$app->get('readinessService');
+        $scorer->resetCache();
+        $report = $scorer->evaluate($id, $channel, true);
+
+        if ($report->isReady) {
+            return [
+                'success' => true,
+                'message' => 'Модель уже готова (100%).',
+                'score'   => $report->score,
+                'missing' => [],
+                'healed'  => [],
+            ];
+        }
+
+        $missing = $report->missing;
+        if (!$missing) {
+            return ['success' => true, 'message' => 'Нет пропущенных полей.', 'score' => $report->score, 'missing' => [], 'healed' => []];
+        }
+
+        try {
+            /** @var AutoHealingService $healer */
+            $healer = Yii::$app->get('autoHealer');
+
+            if (!$healer->hasHealableFields($missing)) {
+                return [
+                    'success' => false,
+                    'message' => 'Нет полей, которые AI может вылечить (только изображения/штрихкоды?).',
+                    'score'   => $report->score,
+                    'missing' => $missing,
+                    'healed'  => [],
+                ];
+            }
+
+            $result = $healer->healModel($id, $missing, $channel);
+
+            // Re-read readiness after heal
+            $scorer->resetCache();
+            $newReport = $scorer->evaluate($id, $channel, true);
+
+            return [
+                'success'      => $result->success,
+                'message'      => $result->success
+                    ? 'AI вылечил: ' . implode(', ', $result->healedFields)
+                    : 'AI не смог: ' . implode('; ', $result->errors),
+                'score'        => $newReport->score,
+                'missing'      => $newReport->missing,
+                'healed'       => $result->healedFields,
+                'newIsReady'   => $newReport->isReady,
+                'errors'       => $result->errors,
+            ];
+        } catch (\Throwable $e) {
+            Yii::error("AI Heal AJAX #{$id}: {$e->getMessage()}", 'catalog');
+            return [
+                'success' => false,
+                'message' => "Ошибка: {$e->getMessage()}",
+                'score'   => $report->score,
+                'missing' => $missing,
+                'healed'  => [],
+            ];
+        }
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * SYNC — ручная отправка на витрину
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    public function actionSync(int $id): Response
     {
         $model = $this->findModel($id);
 
@@ -403,26 +484,21 @@ class CatalogController extends Controller
 
             $projection = $syndicator->buildProductProjection($id);
             if (!$projection) {
-                Yii::$app->session->setFlash('warning', "Не удалось построить проекцию для модели #{$id}.");
+                Yii::$app->session->setFlash('warning', "Не удалось построить проекцию для #{$id}.");
                 return $this->redirect(['view', 'id' => $id]);
             }
 
-            $result = $client->pushProduct($id, $projection);
-            if ($result) {
-                $varCount = $projection['variant_count'] ?? 0;
-                $imgCount = count($projection['images'] ?? []);
-                $price = $projection['best_price']
-                    ? number_format($projection['best_price'], 0, '.', ' ') . ' ₽'
-                    : 'N/A';
-
-                Yii::$app->session->setFlash('success',
-                    "✓ Товар «{$model->name}» отправлен на витрину! ({$varCount} вар., {$imgCount} фото, цена: {$price})"
-                );
+            $ok = $client->pushProduct($id, $projection);
+            if ($ok) {
+                $v = $projection['variant_count'] ?? 0;
+                $i = count($projection['images'] ?? []);
+                $p = $projection['best_price'] ? number_format($projection['best_price'], 0, '.', ' ') . ' ₽' : 'N/A';
+                Yii::$app->session->setFlash('success', "✓ «{$model->name}» → витрина ({$v} вар., {$i} фото, {$p})");
             } else {
                 Yii::$app->session->setFlash('error', "API вернул false при отправке «{$model->name}».");
             }
         } catch (MarketplaceUnavailableException $e) {
-            Yii::$app->session->setFlash('error', "API витрины недоступен: {$e->getMessage()}");
+            Yii::$app->session->setFlash('error', "API недоступен: {$e->getMessage()}");
         } catch (\Throwable $e) {
             Yii::$app->session->setFlash('error', "Ошибка синхронизации: {$e->getMessage()}");
         }
@@ -430,12 +506,75 @@ class CatalogController extends Controller
         return $this->redirect(['view', 'id' => $id]);
     }
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * HELPERS
+     * ═══════════════════════════════════════════════════════════════════ */
+
     protected function findModel(int $id): ProductModel
     {
-        $model = ProductModel::findOne($id);
-        if (!$model) {
+        $m = ProductModel::findOne($id);
+        if (!$m) {
             throw new NotFoundHttpException('Модель не найдена.');
         }
-        return $model;
+        return $m;
+    }
+
+    /**
+     * Parse JSONB canonical_attributes into array.
+     */
+    protected static function parseJsonAttrs($raw): array
+    {
+        if (empty($raw)) return [];
+        if (is_string($raw)) return json_decode($raw, true) ?: [];
+        return is_array($raw) ? $raw : [];
+    }
+
+    /**
+     * Build per-attribute source map: attr_key → ['type' => 'manual_override', 'label' => 'Ручная', 'priority' => 100]
+     *
+     * Goes through data sources from highest priority to lowest.
+     * The first source that declares an attribute "owns" it.
+     */
+    protected static function buildAttrSourceMap(array $dataSources): array
+    {
+        $map = [];
+
+        // dataSources are already ordered by priority DESC
+        foreach ($dataSources as $ds) {
+            /** @var ModelDataSource $ds */
+            $data = $ds->getDataArray();
+            $attrs = $data['attributes'] ?? [];
+
+            foreach ($attrs as $key => $val) {
+                if ($val !== null && $val !== '' && !isset($map[$key])) {
+                    $map[$key] = [
+                        'type'     => $ds->source_type,
+                        'label'    => ModelDataSource::sourceTypes()[$ds->source_type] ?? $ds->source_type,
+                        'priority' => $ds->priority,
+                    ];
+                }
+            }
+        }
+
+        return $map;
+    }
+
+    /**
+     * Find which source provided a top-level field (description, short_description).
+     */
+    protected static function resolveFieldSource(array $dataSources, string $field): ?array
+    {
+        foreach ($dataSources as $ds) {
+            /** @var ModelDataSource $ds */
+            $data = $ds->getDataArray();
+            if (isset($data[$field]) && $data[$field] !== '' && $data[$field] !== null) {
+                return [
+                    'type'     => $ds->source_type,
+                    'label'    => ModelDataSource::sourceTypes()[$ds->source_type] ?? $ds->source_type,
+                    'priority' => $ds->priority,
+                ];
+            }
+        }
+        return null;
     }
 }
