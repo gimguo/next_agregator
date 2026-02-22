@@ -18,16 +18,64 @@ class m260223_020000_seed_default_catalog_template extends Migration
                 [
                     'id' => 1,
                     'name' => 'Матрасы',
-                    'slug' => 'mattresses',
+                    'slug' => 'matrasy',
                     'parent_id' => null,
                     'sort_order' => 1,
+                    'rules' => [
+                        'family' => ['mattress'],
+                    ],
+                    'children' => [
+                        [
+                            'id' => 2,
+                            'name' => 'Пружинные',
+                            'slug' => 'pruzhinnye',
+                            'parent_id' => 1,
+                            'sort_order' => 1,
+                            'rules' => [
+                                'family' => ['mattress'],
+                                'attributes' => [
+                                    'spring_block' => ['tfk', 's1000', 'multipocket'],
+                                ],
+                            ],
+                            'children' => [],
+                        ],
+                        [
+                            'id' => 3,
+                            'name' => 'Беспружинные',
+                            'slug' => 'bespruzhinnye',
+                            'parent_id' => 1,
+                            'sort_order' => 2,
+                            'rules' => [
+                                'family' => ['mattress'],
+                                'attributes' => [
+                                    'spring_block' => ['monolith', 'latex', 'memory'],
+                                ],
+                            ],
+                            'children' => [],
+                        ],
+                    ],
                 ],
                 [
-                    'id' => 2,
+                    'id' => 4,
                     'name' => 'Кровати',
-                    'slug' => 'beds',
+                    'slug' => 'krovati',
                     'parent_id' => null,
                     'sort_order' => 2,
+                    'rules' => [
+                        'family' => ['bed'],
+                    ],
+                    'children' => [],
+                ],
+                [
+                    'id' => 5,
+                    'name' => 'Подушки',
+                    'slug' => 'podushki',
+                    'parent_id' => null,
+                    'sort_order' => 3,
+                    'rules' => [
+                        'family' => ['pillow'],
+                    ],
+                    'children' => [],
                 ],
             ],
         ];

@@ -40,8 +40,40 @@ foreach ($categories as $cat) {
     }
 }
 
+// Функция для форматирования правил категории
+$formatRules = function ($rules) {
+    if (empty($rules) || !is_array($rules)) {
+        return null;
+    }
+    
+    $parts = [];
+    
+    // Family
+    if (isset($rules['family']) && is_array($rules['family'])) {
+        $familyLabels = [];
+        foreach ($rules['family'] as $family) {
+            $familyLabels[] = Html::encode($family);
+        }
+        if (!empty($familyLabels)) {
+            $parts[] = 'Семейство: ' . implode(', ', $familyLabels);
+        }
+    }
+    
+    // Attributes
+    if (isset($rules['attributes']) && is_array($rules['attributes'])) {
+        foreach ($rules['attributes'] as $attrKey => $allowedValues) {
+            if (is_array($allowedValues) && !empty($allowedValues)) {
+                $valueStr = implode(', ', array_map(function($v) { return Html::encode($v); }, $allowedValues));
+                $parts[] = Html::encode($attrKey) . ': ' . $valueStr;
+            }
+        }
+    }
+    
+    return !empty($parts) ? implode('; ', $parts) : null;
+};
+
 // Функция для рекурсивного вывода категорий
-$renderCategory = function ($catId) use (&$renderCategory, $categoryTree, $productsByCategory) {
+$renderCategory = function ($catId) use (&$renderCategory, $categoryTree, $productsByCategory, $formatRules) {
     $node = $categoryTree[$catId] ?? null;
     if (!$node) return '';
     
@@ -50,17 +82,26 @@ $renderCategory = function ($catId) use (&$renderCategory, $categoryTree, $produ
     $slug = $cat['slug'] ?? '';
     $productCount = $node['product_count'];
     $children = $node['children'];
+    $rules = $cat['rules'] ?? null;
+    $rulesText = $formatRules($rules);
     
     $html = '<li class="category-item mb-2">';
     $html .= '<div class="d-flex align-items-center justify-content-between p-2" style="background:var(--bg-elevated);border-radius:6px;border:1px solid var(--border)">';
-    $html .= '<div class="d-flex align-items-center">';
+    $html .= '<div class="flex-grow-1">';
+    $html .= '<div class="d-flex align-items-center mb-1">';
     $html .= '<i class="fas fa-folder me-2" style="color:var(--accent);font-size:.85rem"></i>';
     $html .= '<strong style="font-size:.9rem">' . Html::encode($name) . '</strong>';
     if ($slug) {
         $html .= ' <code style="font-size:.7rem;margin-left:8px;color:var(--text-muted)">' . Html::encode($slug) . '</code>';
     }
     $html .= '</div>';
-    $html .= '<span class="badge bg-info" style="font-size:.75rem;font-weight:600">' . number_format($productCount) . '</span>';
+    if ($rulesText) {
+        $html .= '<div style="font-size:.7rem;color:var(--text-muted);margin-left:24px;font-style:italic">';
+        $html .= '<i class="fas fa-filter me-1" style="font-size:.65rem"></i>' . $rulesText;
+        $html .= '</div>';
+    }
+    $html .= '</div>';
+    $html .= '<span class="badge bg-info ms-2" style="font-size:.75rem;font-weight:600">' . number_format($productCount) . '</span>';
     $html .= '</div>';
     
     if (!empty($children)) {

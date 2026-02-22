@@ -27,41 +27,15 @@ $this->params['breadcrumbs'][] = $this->title;
 
     <div class="card">
         <div class="card-body">
-            <?php $form = ActiveForm::begin(); ?>
-
-            <?= $form->field($model, 'name')
-                ->textInput(['maxlength' => true])
-                ->label('Название шаблона')
-                ->hint('Уникальное название для идентификации шаблона') ?>
-
-            <?= $form->field($model, 'description')
-                ->textarea(['rows' => 3])
-                ->label('Описание')
-                ->hint('Краткое описание назначения шаблона (необязательно)') ?>
-
-            <?= $form->field($model, 'structure_json')
-                ->textarea(['rows' => 15, 'style' => 'font-family:monospace;font-size:.85rem'])
-                ->label('Структура категорий (JSON)')
-                ->hint('JSON структура категорий каталога. Пример: {"categories": [{"id": 1, "name": "Матрасы", "slug": "matrasy", "parent_id": null}]}') ?>
-
-            <?= $form->field($model, 'merge_rules')
-                ->textarea(['rows' => 5, 'style' => 'font-family:monospace;font-size:.85rem'])
-                ->label('Правила объединения (JSON)')
-                ->hint('JSON правила объединения категорий (необязательно)') ?>
-
-            <div class="form-group mt-4">
-                <?= Html::submitButton(
-                    '<i class="fas fa-save me-1"></i> Создать',
-                    ['class' => 'btn btn-accent btn-lg']
-                ) ?>
+            <?= $this->render('_form', ['model' => $model, 'isSystem' => false]) ?>
+            
+            <div class="mt-3">
                 <?= Html::a(
                     'Отмена',
                     ['index'],
-                    ['class' => 'btn btn-dark-outline btn-lg ms-2']
+                    ['class' => 'btn btn-dark-outline']
                 ) ?>
             </div>
-
-            <?php ActiveForm::end(); ?>
         </div>
     </div>
 
