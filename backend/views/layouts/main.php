@@ -7,13 +7,13 @@ use backend\assets\AppAsset;
 use common\widgets\Alert;
 use yii\bootstrap5\Breadcrumbs;
 use yii\bootstrap5\Html;
-use yii\bootstrap5\Nav;
-use yii\bootstrap5\NavBar;
+use yii\helpers\Url;
 
 AppAsset::register($this);
 
 $controller = Yii::$app->controller->id;
 $action = Yii::$app->controller->action->id ?? '';
+$isGuest = Yii::$app->user->isGuest;
 ?>
 <?php $this->beginPage() ?>
 <!DOCTYPE html>
@@ -31,163 +31,202 @@ $action = Yii::$app->controller->action->id ?? '';
 <body class="d-flex flex-column h-100">
 <?php $this->beginBody() ?>
 
-<header>
-    <?php
-    NavBar::begin([
-        'brandLabel' => '<i class="fas fa-cubes" style="color:#4f8cff;margin-right:6px"></i> PIM Агрегатор',
-        'brandUrl' => ['/dashboard/index'],
-        'options' => [
-            'class' => 'navbar navbar-expand-lg navbar-dark bg-dark fixed-top',
-        ],
-    ]);
+<?php if (!$isGuest): ?>
 
-    $menuItems = [];
-    if (!Yii::$app->user->isGuest) {
-        $menuItems = [
-            [
-                'label' => '<i class="fas fa-tachometer-alt"></i> Дашборд',
-                'encode' => false,
-                'url' => ['/dashboard/index'],
-                'active' => $controller === 'dashboard',
-            ],
+<!-- ═══ TOP BAR ═══ -->
+<header class="pim-topbar">
+    <div class="pim-topbar-inner">
+        <a href="<?= Url::to(['/dashboard/index']) ?>" class="pim-topbar-brand">
+            <i class="fas fa-cubes"></i>
+            <span>PIM Агрегатор</span>
+        </a>
 
-            // ═══ Каталог (MDM) ═══
-            [
-                'label' => '<i class="fas fa-database"></i> Каталог',
-                'encode' => false,
-                'active' => in_array($controller, ['catalog', 'pricing-rule']),
-                'items' => [
-                    [
-                        'label' => '<i class="fas fa-boxes-stacked fa-fw"></i> MDM Модели',
-                        'encode' => false,
-                        'url' => ['/catalog/index'],
-                        'active' => $controller === 'catalog',
-                    ],
-                    '<li><hr class="dropdown-divider"></li>',
-                    [
-                        'label' => '<i class="fas fa-tags fa-fw"></i> Наценки (Pricing)',
-                        'encode' => false,
-                        'url' => ['/pricing-rule/index'],
-                        'active' => $controller === 'pricing-rule',
-                    ],
-                ],
-            ],
+        <div class="pim-topbar-right">
+            <a href="https://ros-matras.ru" target="_blank" class="pim-topbar-link" title="Открыть витрину">
+                <i class="fas fa-external-link-alt"></i>
+                <span class="d-none d-sm-inline">Витрина</span>
+            </a>
+            <div class="pim-topbar-user">
+                <i class="fas fa-user-circle"></i>
+                <span><?= Html::encode(Yii::$app->user->identity->username) ?></span>
+            </div>
+            <?= Html::beginForm(['/site/logout'], 'post', ['class' => 'd-inline']) ?>
+                <?= Html::submitButton('<i class="fas fa-sign-out-alt"></i>', [
+                    'class' => 'pim-topbar-logout',
+                    'title' => 'Выход',
+                ]) ?>
+            <?= Html::endForm() ?>
 
-            // ═══ Данные ═══
-            [
-                'label' => '<i class="fas fa-truck"></i> Данные',
-                'encode' => false,
-                'active' => in_array($controller, ['supplier', 'supplier-fetch-config', 'staging-ui', 'media-ui']),
-                'items' => [
-                    [
-                        'label' => '<i class="fas fa-building fa-fw"></i> Поставщики',
-                        'encode' => false,
-                        'url' => ['/supplier/index'],
-                        'active' => $controller === 'supplier',
-                    ],
-                    [
-                        'label' => '<i class="fas fa-layer-group fa-fw"></i> Staging (сырые)',
-                        'encode' => false,
-                        'url' => ['/staging-ui/index'],
-                        'active' => $controller === 'staging-ui',
-                    ],
-                    [
-                        'label' => '<i class="fas fa-images fa-fw"></i> Медиа (S3)',
-                        'encode' => false,
-                        'url' => ['/media-ui/index'],
-                        'active' => $controller === 'media-ui',
-                    ],
-                ],
-            ],
-
-            // ═══ Экспорт и Качество ═══
-            [
-                'label' => '<i class="fas fa-rocket"></i> Экспорт',
-                'encode' => false,
-                'active' => in_array($controller, ['outbox-ui', 'quality']),
-                'items' => [
-                    [
-                        'label' => '<i class="fas fa-paper-plane fa-fw"></i> Outbox',
-                        'encode' => false,
-                        'url' => ['/outbox-ui/index'],
-                        'active' => $controller === 'outbox-ui',
-                    ],
-                    [
-                        'label' => '<i class="fas fa-clipboard-check fa-fw"></i> Качество данных',
-                        'encode' => false,
-                        'url' => ['/quality/index'],
-                        'active' => $controller === 'quality',
-                    ],
-                ],
-            ],
-
-            // ═══ Система ═══
-            [
-                'label' => '<i class="fas fa-server"></i> Система',
-                'encode' => false,
-                'active' => $controller === 'queue-dashboard',
-                'items' => [
-                    [
-                        'label' => '<i class="fas fa-list-check fa-fw"></i> Очередь (Redis)',
-                        'encode' => false,
-                        'url' => ['/queue-dashboard/index'],
-                        'active' => $controller === 'queue-dashboard',
-                    ],
-                    '<li><hr class="dropdown-divider"></li>',
-                    [
-                        'label' => '<i class="fas fa-database fa-fw"></i> Adminer',
-                        'encode' => false,
-                        'url' => '/adminer',
-                        'linkOptions' => ['target' => '_blank'],
-                    ],
-                ],
-            ],
-        ];
-    }
-
-    echo Nav::widget([
-        'options' => ['class' => 'navbar-nav me-auto mb-2 mb-lg-0'],
-        'items' => $menuItems,
-        'encodeLabels' => false,
-        'dropdownClass' => 'yii\bootstrap5\Dropdown',
-    ]);
-
-    if (!Yii::$app->user->isGuest) {
-        echo Html::beginForm(['/site/logout'], 'post', ['class' => 'd-flex align-items-center'])
-            . '<span class="text-secondary me-2" style="font-size:.82rem">'
-            . '<i class="fas fa-user-circle me-1"></i>'
-            . Html::encode(Yii::$app->user->identity->username)
-            . '</span>'
-            . Html::submitButton(
-                '<i class="fas fa-sign-out-alt"></i> Выход',
-                ['class' => 'btn btn-sm btn-dark-outline']
-            )
-            . Html::endForm();
-    }
-
-    NavBar::end();
-    ?>
+            <!-- Mobile sidebar toggle -->
+            <button class="pim-sidebar-toggle d-xl-none" id="sidebar-toggle" type="button" title="Меню">
+                <i class="fas fa-bars"></i>
+            </button>
+        </div>
+    </div>
 </header>
 
-<main role="main" class="flex-shrink-0">
-    <div class="container-fluid">
-        <?= Breadcrumbs::widget([
-            'links' => isset($this->params['breadcrumbs']) ? $this->params['breadcrumbs'] : [],
-        ]) ?>
-        <?= Alert::widget() ?>
-        <?= $content ?>
-    </div>
-</main>
+<!-- ═══ LAYOUT: Content + Right Sidebar ═══ -->
+<div class="pim-layout">
 
-<footer class="footer mt-auto">
-    <div class="container-fluid d-flex justify-content-between">
-        <span>&copy; PIM Агрегатор <?= date('Y') ?></span>
-        <span class="d-flex align-items-center gap-3">
-            <span>v3.0</span>
-            <span><i class="fas fa-database fa-sm"></i> <?= Yii::$app->db->driverName ?></span>
-        </span>
-    </div>
-</footer>
+    <!-- MAIN CONTENT -->
+    <main class="pim-main" role="main">
+        <div class="pim-content">
+            <?= Breadcrumbs::widget([
+                'links' => isset($this->params['breadcrumbs']) ? $this->params['breadcrumbs'] : [],
+            ]) ?>
+            <?= Alert::widget() ?>
+            <?= $content ?>
+        </div>
+    </main>
+
+    <!-- ═══ RIGHT SIDEBAR ═══ -->
+    <aside class="pim-sidebar" id="pim-sidebar">
+        <div class="pim-sidebar-scroll">
+
+            <!-- ── Навигация ── -->
+            <nav class="pim-nav">
+
+                <div class="pim-nav-section">
+                    <div class="pim-nav-section-label">Основное</div>
+                    <a href="<?= Url::to(['/dashboard/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'dashboard' ? 'active' : '' ?>">
+                        <i class="fas fa-tachometer-alt"></i>
+                        <span>Дашборд</span>
+                    </a>
+                </div>
+
+                <div class="pim-nav-section">
+                    <div class="pim-nav-section-label">Каталог</div>
+                    <a href="<?= Url::to(['/catalog/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'catalog' && $action !== 'cards' ? 'active' : '' ?>">
+                        <i class="fas fa-database"></i>
+                        <span>MDM Модели</span>
+                        <?php
+                        try {
+                            $modelCount = \common\models\ProductModel::find()->count();
+                            echo '<span class="pim-nav-badge">' . number_format($modelCount) . '</span>';
+                        } catch (\Exception $e) {}
+                        ?>
+                    </a>
+                    <a href="<?= Url::to(['/catalog/cards']) ?>"
+                       class="pim-nav-item <?= $controller === 'catalog' && $action === 'cards' ? 'active' : '' ?>">
+                        <i class="fas fa-id-card"></i>
+                        <span>Карточки товаров</span>
+                    </a>
+                    <a href="<?= Url::to(['/pricing-rule/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'pricing-rule' ? 'active' : '' ?>">
+                        <i class="fas fa-tags"></i>
+                        <span>Наценки</span>
+                    </a>
+                </div>
+
+                <div class="pim-nav-section">
+                    <div class="pim-nav-section-label">Данные</div>
+                    <a href="<?= Url::to(['/supplier/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'supplier' ? 'active' : '' ?>">
+                        <i class="fas fa-building"></i>
+                        <span>Поставщики</span>
+                    </a>
+                    <a href="<?= Url::to(['/supplier-fetch-config/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'supplier-fetch-config' ? 'active' : '' ?>">
+                        <i class="fas fa-clock-rotate-left"></i>
+                        <span>Авто-забор</span>
+                    </a>
+                    <a href="<?= Url::to(['/staging-ui/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'staging-ui' ? 'active' : '' ?>">
+                        <i class="fas fa-layer-group"></i>
+                        <span>Staging</span>
+                    </a>
+                    <a href="<?= Url::to(['/media-ui/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'media-ui' ? 'active' : '' ?>">
+                        <i class="fas fa-images"></i>
+                        <span>Медиа (S3)</span>
+                    </a>
+                </div>
+
+                <div class="pim-nav-section">
+                    <div class="pim-nav-section-label">Экспорт & Качество</div>
+                    <a href="<?= Url::to(['/outbox-ui/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'outbox-ui' ? 'active' : '' ?>">
+                        <i class="fas fa-paper-plane"></i>
+                        <span>Outbox</span>
+                    </a>
+                    <a href="<?= Url::to(['/quality/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'quality' ? 'active' : '' ?>">
+                        <i class="fas fa-clipboard-check"></i>
+                        <span>Качество данных</span>
+                    </a>
+                </div>
+
+                <div class="pim-nav-section">
+                    <div class="pim-nav-section-label">Система</div>
+                    <a href="<?= Url::to(['/queue-dashboard/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'queue-dashboard' ? 'active' : '' ?>">
+                        <i class="fas fa-list-check"></i>
+                        <span>Очередь (Redis)</span>
+                    </a>
+                    <a href="/adminer" target="_blank" class="pim-nav-item">
+                        <i class="fas fa-database"></i>
+                        <span>Adminer</span>
+                        <i class="fas fa-external-link-alt pim-nav-external"></i>
+                    </a>
+                </div>
+
+            </nav>
+
+            <!-- ── Sidebar Footer ── -->
+            <div class="pim-sidebar-footer">
+                <div class="pim-sidebar-footer-line">
+                    <i class="fas fa-code-branch"></i> v3.1
+                </div>
+                <div class="pim-sidebar-footer-line">
+                    <i class="fas fa-database"></i> <?= Yii::$app->db->driverName ?>
+                </div>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Sidebar overlay (mobile) -->
+    <div class="pim-sidebar-overlay d-xl-none" id="sidebar-overlay"></div>
+</div>
+
+<?php else: ?>
+    <!-- Guest mode (login page) -->
+    <main role="main" class="flex-shrink-0">
+        <div class="container-fluid">
+            <?= Alert::widget() ?>
+            <?= $content ?>
+        </div>
+    </main>
+<?php endif; ?>
+
+<script>
+// Sidebar toggle for mobile
+(function() {
+    var toggle = document.getElementById('sidebar-toggle');
+    var sidebar = document.getElementById('pim-sidebar');
+    var overlay = document.getElementById('sidebar-overlay');
+    if (!toggle || !sidebar) return;
+
+    function openSidebar() {
+        sidebar.classList.add('open');
+        if (overlay) overlay.classList.add('active');
+        document.body.style.overflow = 'hidden';
+    }
+    function closeSidebar() {
+        sidebar.classList.remove('open');
+        if (overlay) overlay.classList.remove('active');
+        document.body.style.overflow = '';
+    }
+
+    toggle.addEventListener('click', function() {
+        sidebar.classList.contains('open') ? closeSidebar() : openSidebar();
+    });
+    if (overlay) {
+        overlay.addEventListener('click', closeSidebar);
+    }
+})();
+</script>
 
 <?php $this->endBody() ?>
 </body>

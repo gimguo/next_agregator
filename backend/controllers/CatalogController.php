@@ -75,6 +75,53 @@ class CatalogController extends Controller
     }
 
     /* ═══════════════════════════════════════════════════════════════════════
+     * CARDS — Визуальные карточки товаров
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    public function actionCards(): string
+    {
+        $searchModel = new ProductModelSearch();
+        $dataProvider = $searchModel->search(Yii::$app->request->queryParams);
+        $dataProvider->pagination->pageSize = 24;
+
+        // Предзагрузка readiness для всех моделей на странице
+        $modelIds = array_map(
+            fn($m) => $m->id,
+            $dataProvider->getModels()
+        );
+        $readinessMap = [];
+        if ($modelIds) {
+            $rows = ModelChannelReadiness::find()
+                ->where(['model_id' => $modelIds])
+                ->indexBy('model_id')
+                ->all();
+            $readinessMap = $rows;
+        }
+
+        // Предзагрузка primary-фото
+        $imageMap = [];
+        if ($modelIds) {
+            $imgs = MediaAsset::find()
+                ->where([
+                    'entity_type' => 'model',
+                    'entity_id'   => $modelIds,
+                    'is_primary'  => true,
+                    'status'      => 'processed',
+                ])
+                ->indexBy('entity_id')
+                ->all();
+            $imageMap = $imgs;
+        }
+
+        return $this->render('cards', [
+            'searchModel'   => $searchModel,
+            'dataProvider'  => $dataProvider,
+            'readinessMap'  => $readinessMap,
+            'imageMap'      => $imageMap,
+        ]);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
      * VIEW — PIM Cockpit
      * ═══════════════════════════════════════════════════════════════════ */
 
