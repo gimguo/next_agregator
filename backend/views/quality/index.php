@@ -240,11 +240,11 @@ $this->params['breadcrumbs'][] = $this->title;
                         },
                     ],
                     [
-                        'attribute' => 'updated_at',
+                        'attribute' => 'checked_at',
                         'label' => 'Обновлено',
                         'headerOptions' => ['style' => 'width:120px'],
                         'value' => function ($m) {
-                            return $m->updated_at ? Yii::$app->formatter->asRelativeTime($m->updated_at) : '—';
+                            return $m->checked_at ? Yii::$app->formatter->asRelativeTime($m->checked_at) : '—';
                         },
                     ],
                 ],
