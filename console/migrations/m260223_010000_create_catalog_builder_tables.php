@@ -24,7 +24,7 @@ class m260223_010000_create_catalog_builder_tables extends Migration
             'is_system' => $this->boolean()->defaultValue(false)->comment('Системный (нельзя удалить)'),
             'created_at' => $this->timestamp()->defaultExpression('CURRENT_TIMESTAMP')->comment('Дата создания'),
             'updated_at' => $this->timestamp()->defaultExpression('CURRENT_TIMESTAMP')->comment('Дата обновления'),
-        ], 'COMMENT "Шаблоны каталогов"');
+        ]);
 
         $this->createIndex('idx-catalog-templates-is-system', '{{%catalog_templates}}', 'is_system');
 
@@ -41,7 +41,7 @@ class m260223_010000_create_catalog_builder_tables extends Migration
             'created_by' => $this->integer()->unsigned()->comment('ID пользователя'),
             'created_at' => $this->timestamp()->defaultExpression('CURRENT_TIMESTAMP')->comment('Дата создания'),
             'updated_at' => $this->timestamp()->defaultExpression('CURRENT_TIMESTAMP')->comment('Дата обновления'),
-        ], 'COMMENT "Предпросмотры каталогов"');
+        ]);
 
         $this->addForeignKey(
             'fk-catalog-previews-template-id',
@@ -62,7 +62,7 @@ class m260223_010000_create_catalog_builder_tables extends Migration
             'status' => $this->string(20)->defaultValue('pending')->comment('Статус: pending, processing, completed, failed'),
             'stats_json' => $this->db->getSchema()->createColumnSchemaBuilder('jsonb')->comment('Статистика экспорта (JSONB)'),
             'created_at' => $this->timestamp()->defaultExpression('CURRENT_TIMESTAMP')->comment('Дата создания'),
-        ], 'COMMENT "История экспортов каталога"');
+        ]);
 
         $this->addForeignKey(
             'fk-catalog-exports-preview-id',
