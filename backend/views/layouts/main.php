@@ -113,6 +113,11 @@ $isGuest = Yii::$app->user->isGuest;
                         <i class="fas fa-sitemap"></i>
                         <span>Конструктор каталога</span>
                     </a>
+                    <a href="<?= Url::to(['/catalog-template/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'catalog-template' ? 'active' : '' ?>">
+                        <i class="fas fa-file-code"></i>
+                        <span>Шаблоны каталога</span>
+                    </a>
                     <a href="<?= Url::to(['/pricing-rule/index']) ?>"
                        class="pim-nav-item <?= $controller === 'pricing-rule' ? 'active' : '' ?>">
                         <i class="fas fa-tags"></i>
@@ -129,7 +134,7 @@ $isGuest = Yii::$app->user->isGuest;
                     </a>
                     <a href="<?= Url::to(['/supplier-fetch-config/index']) ?>"
                        class="pim-nav-item <?= $controller === 'supplier-fetch-config' ? 'active' : '' ?>">
-                        <i class="fas fa-clock-rotate-left"></i>
+                        <i class="fas fa-cloud-arrow-down"></i>
                         <span>Сборщик прайсов</span>
                     </a>
                     <a href="<?= Url::to(['/staging-ui/index']) ?>"
