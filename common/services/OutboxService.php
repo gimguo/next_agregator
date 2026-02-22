@@ -94,6 +94,38 @@ class OutboxService extends Component
         $this->fanOut('offer', $offerId, $modelId, 'stock_changed', MarketplaceOutbox::LANE_STOCK, $stockDelta, 'catalog_persister', $sessionId);
     }
 
+    /**
+     * Структура каталога обновлена (category_tree).
+     * Lane: content_updated → воркер пошлёт полную структуру категорий.
+     *
+     * @param int $previewId ID предпросмотра каталога
+     * @param int|null $channelId ID канала (если null, то fan-out на все активные)
+     */
+    public function emitCategoryTreeUpdate(int $previewId, ?int $channelId = null): void
+    {
+        $payload = ['preview_id' => $previewId];
+        
+        if ($channelId) {
+            // Отправка в конкретный канал
+            $channel = SalesChannel::findOne($channelId);
+            if (!$channel || !$channel->is_active) {
+                Yii::warning("OutboxService: channel #{$channelId} not found or inactive", 'marketplace.outbox');
+                return;
+            }
+            // Используем fanOut, но временно фильтруем каналы
+            $oldChannels = $this->activeChannelsCache;
+            $this->activeChannelsCache = [$channel];
+            try {
+                $this->fanOut('category_tree', $previewId, 0, 'catalog_tree_updated', MarketplaceOutbox::LANE_CONTENT, $payload, 'catalog_builder', null);
+            } finally {
+                $this->activeChannelsCache = $oldChannels;
+            }
+        } else {
+            // Fan-out на все активные каналы
+            $this->fanOut('category_tree', $previewId, 0, 'catalog_tree_updated', MarketplaceOutbox::LANE_CONTENT, $payload, 'catalog_builder', null);
+        }
+    }
+
     // ═══════════════════════════════════════════
     // LEGACY API (обратная совместимость)
     // Все legacy-методы маппят на lane = content_updated

@@ -135,6 +135,11 @@ return [
             'class' => \common\services\VariantExploderService::class,
         ],
 
+        // ═══ Catalog Builder — конструктор каталога для витрины (Sprint 17) ═══
+        'catalogBuilder' => [
+            'class' => \common\services\CatalogBuilderService::class,
+        ],
+
         // ═══ DAM — Digital Asset Management (S3/MinIO медиа-пайплайн) ═══
         'mediaService' => [
             'class' => \common\services\MediaProcessingService::class,

@@ -267,6 +267,53 @@ class RosMatrasChannelClient extends Component implements ApiClientInterface
     }
 
     // ═══════════════════════════════════════════
+    // ApiClientInterface — Category Tree
+    // ═══════════════════════════════════════════
+
+    /**
+     * {@inheritdoc}
+     * Отправка структуры каталога на витрину.
+     */
+    public function pushCategoryTree(array $payload, SalesChannel $channel): bool
+    {
+        try {
+            $response = $this->sendWithRetry('POST', 'import/catalog', $payload, $channel);
+        } catch (MarketplaceUnavailableException $e) {
+            throw $e;
+        }
+
+        $statusCode = $response['status'];
+        $body = $response['body'];
+
+        if ($statusCode >= 200 && $statusCode < 300) {
+            $previewId = $payload['preview_id'] ?? '?';
+            Yii::info(
+                "RosMatrasChannel[{$channel->name}]: pushed catalog tree preview_id={$previewId} → HTTP {$statusCode}",
+                'catalog.builder'
+            );
+            return true;
+        }
+
+        $errorMsg = $body['message'] ?? ($body['error'] ?? json_encode($body));
+
+        // 4xx → DLQ
+        if ($statusCode >= 400 && $statusCode < 500) {
+            throw new ChannelValidationException(
+                "HTTP {$statusCode}: {$errorMsg}",
+                $statusCode,
+                $channel->name,
+                $payload
+            );
+        }
+
+        Yii::error(
+            "RosMatrasChannel[{$channel->name}]: pushCategoryTree failed → HTTP {$statusCode}: {$errorMsg}",
+            'catalog.builder'
+        );
+        return false;
+    }
+
+    // ═══════════════════════════════════════════
     // Health Check
     // ═══════════════════════════════════════════
 

@@ -73,4 +73,28 @@ interface SyndicatorInterface
      * @return array|null Проекция остатков или null
      */
     public function buildStockProjection(int $modelId, SalesChannel $channel): ?array;
+
+    /**
+     * Построить проекцию структуры каталога (дерево категорий).
+     * Lane: content_updated (entity_type = 'category_tree')
+     *
+     * Формат (рекомендуемый):
+     *   [
+     *     'preview_id' => 123,
+     *     'categories' => [
+     *       ['id' => 1, 'name' => 'Матрасы', 'slug' => 'mattresses', 'parent_id' => null, 'product_count' => 245],
+     *       ['id' => 2, 'name' => 'Пружинные', 'slug' => 'spring', 'parent_id' => 1, 'product_count' => 120],
+     *     ],
+     *     'products_by_category' => [
+     *       1 => [101, 102, 103],  // model_id[]
+     *       2 => [104, 105],
+     *     ],
+     *   ]
+     *
+     * @param int          $previewId ID catalog_preview
+     * @param SalesChannel $channel   Канал продаж
+     *
+     * @return array|null Проекция структуры каталога или null
+     */
+    public function buildCategoryTreeProjection(int $previewId, SalesChannel $channel): ?array;
 }

@@ -217,6 +217,45 @@ class RosMatrasSyndicator extends Component implements SyndicatorInterface
     }
 
     /**
+     * {@inheritdoc}
+     * Проекция структуры каталога (lane: content_updated, entity_type = 'category_tree').
+     *
+     * Берет preview_data из CatalogPreview и формирует дерево категорий для витрины.
+     */
+    public function buildCategoryTreeProjection(int $previewId, SalesChannel $channel): ?array
+    {
+        $preview = \common\models\CatalogPreview::findOne($previewId);
+        if (!$preview) {
+            Yii::warning("RosMatrasSyndicator: preview #{$previewId} not found", 'catalog.builder');
+            return null;
+        }
+
+        $previewData = $preview->getPreviewDataArray();
+        if (empty($previewData)) {
+            Yii::warning("RosMatrasSyndicator: preview #{$previewId} has empty preview_data", 'catalog.builder');
+            return null;
+        }
+
+        $categories = $previewData['categories'] ?? [];
+        $productsByCategory = $previewData['products_by_category'] ?? [];
+
+        // Добавляем product_count к каждой категории
+        foreach ($categories as &$cat) {
+            $catId = $cat['id'] ?? null;
+            $cat['product_count'] = isset($productsByCategory[$catId]) ? count($productsByCategory[$catId]) : 0;
+        }
+        unset($cat);
+
+        return [
+            'preview_id' => $previewId,
+            'categories' => $categories,
+            'products_by_category' => $productsByCategory,
+            'total_products' => $previewData['total_products'] ?? 0,
+            'total_categories' => $previewData['total_categories'] ?? 0,
+        ];
+    }
+
+    /**
      * Получить базовый сервис (lazy load из DI).
      */
     private function getService(): RosMatrasSyndicationService

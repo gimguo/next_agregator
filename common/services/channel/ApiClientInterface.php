@@ -77,6 +77,19 @@ interface ApiClientInterface
     public function pushStocks(array $stockItems, SalesChannel $channel): bool;
 
     /**
+     * Отправить структуру каталога (дерево категорий).
+     * Lane: content_updated (entity_type = 'category_tree')
+     *
+     * @param array        $payload Проекция из SyndicatorInterface::buildCategoryTreeProjection()
+     * @param SalesChannel $channel Канал продаж
+     *
+     * @return bool
+     * @throws \common\services\marketplace\MarketplaceUnavailableException
+     * @throws \common\services\channel\ChannelValidationException
+     */
+    public function pushCategoryTree(array $payload, SalesChannel $channel): bool;
+
+    /**
      * Проверить доступность API канала.
      *
      * @param SalesChannel $channel Канал продаж

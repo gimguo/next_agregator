@@ -98,7 +98,7 @@ $isGuest = Yii::$app->user->isGuest;
                 <div class="pim-nav-section">
                     <div class="pim-nav-section-label">Каталог</div>
                     <a href="<?= Url::to(['/catalog/index']) ?>"
-                       class="pim-nav-item <?= $controller === 'catalog' && $action !== 'cards' ? 'active' : '' ?>">
+                       class="pim-nav-item <?= $controller === 'catalog' && $action !== 'cards' && $controller !== 'catalog-builder' ? 'active' : '' ?>">
                         <i class="fas fa-database"></i>
                         <span>MDM Модели</span>
                         <?php
@@ -112,6 +112,11 @@ $isGuest = Yii::$app->user->isGuest;
                        class="pim-nav-item <?= $controller === 'catalog' && $action === 'cards' ? 'active' : '' ?>">
                         <i class="fas fa-id-card"></i>
                         <span>Карточки товаров</span>
+                    </a>
+                    <a href="<?= Url::to(['/catalog-builder/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'catalog-builder' ? 'active' : '' ?>">
+                        <i class="fas fa-sitemap"></i>
+                        <span>Конструктор каталога</span>
                     </a>
                     <a href="<?= Url::to(['/pricing-rule/index']) ?>"
                        class="pim-nav-item <?= $controller === 'pricing-rule' ? 'active' : '' ?>">
