@@ -34,8 +34,8 @@
 
     /* ── Semantic ── */
     --success:   #34d399;
-    --warning:   #fbbf24;
-    --danger:    #f87171;
+    --warning:   #FFFF00;
+    --danger:    #FF0000;
     --info:      #38bdf8;
     --purple:    #a78bfa;
 
@@ -974,4 +974,45 @@ a.text-decoration-none:hover { text-decoration: none !important; }
 @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: .3; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CATALOG BUILDER — Дерево категорий
+   ═══════════════════════════════════════════════════════════════════════ */
+.category-tree {
+    margin: 0;
+    padding: 0;
+}
+.category-item {
+    margin-bottom: 8px;
+}
+.category-item .category-children {
+    margin-top: 8px;
+    margin-left: 24px;
+    padding-left: 0;
+    border-left: 2px solid var(--border);
+    padding-left: 12px;
+}
+.category-item:hover {
+    opacity: 0.9;
+}
+.supplier-checkboxes {
+    max-height: 300px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    background: var(--bg-elevated);
+}
+.supplier-checkboxes .form-check {
+    padding: 4px 0;
+}
+.supplier-checkboxes .form-check-label {
+    color: var(--text-primary);
+    font-size: .85rem;
+    cursor: pointer;
+}
+.supplier-checkboxes .form-check-input:checked + .form-check-label {
+    color: var(--accent);
+    font-weight: 500;
 }
