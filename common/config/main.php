@@ -32,6 +32,11 @@ return [
             'class' => \common\services\AIService::class,
         ],
 
+        // ═══ Brand Resolver — склейка брендов с AI Entity Resolution (Sprint 22) ═══
+        'brandResolver' => [
+            'class' => \common\services\BrandResolverService::class,
+        ],
+
         // ═══ Сервис управления брендами ═══
         // aiService подтягивается из Yii::$app в init()
         'brandService' => [

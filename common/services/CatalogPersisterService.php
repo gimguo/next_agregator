@@ -554,21 +554,12 @@ class CatalogPersisterService extends Component
         $brand = $dto->brand ?? $dto->manufacturer;
         if (empty($brand)) return null;
 
-        $db = Yii::$app->db;
+        // Используем BrandResolverService (Sprint 22)
+        /** @var \common\services\BrandResolverService $brandResolver */
+        $brandResolver = Yii::$app->get('brandResolver');
+        $resolvedBrand = $brandResolver->resolve($brand);
 
-        $id = $db->createCommand(
-            "SELECT id FROM {{%brands}} WHERE canonical_name = :name LIMIT 1",
-            [':name' => $brand]
-        )->queryScalar();
-
-        if ($id) return (int)$id;
-
-        $id = $db->createCommand(
-            "SELECT brand_id FROM {{%brand_aliases}} WHERE alias ILIKE :name LIMIT 1",
-            [':name' => $brand]
-        )->queryScalar();
-
-        return $id ? (int)$id : null;
+        return $resolvedBrand ? $resolvedBrand->id : null;
     }
 
     protected function resolveCategoryId(?string $categoryPath, string $family): ?int

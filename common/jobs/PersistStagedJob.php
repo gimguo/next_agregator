@@ -134,12 +134,25 @@ class PersistStagedJob extends BaseObject implements JobInterface
                     $row['normalized_data']
                 );
 
+                // Извлекаем brand_id из normalized_data (Sprint 22)
+                $normalizedData = is_string($row['normalized_data']) 
+                    ? json_decode($row['normalized_data'], true) 
+                    : ($row['normalized_data'] ?? []);
+                $context = [];
+                if (isset($normalizedData['_brand_id']) && $normalizedData['_brand_id'] !== null) {
+                    $context['brand_id'] = (int)$normalizedData['_brand_id'];
+                }
+                if (isset($normalizedData['_product_family'])) {
+                    $context['product_family'] = $normalizedData['_product_family'];
+                }
+
                 $tx = $db->beginTransaction();
 
                 $result = $persister->persist(
                     $dto,
                     $this->supplierId,
                     $this->sessionId,
+                    $context, // Передаём контекст с brand_id
                 );
 
                 $tx->commit();

@@ -3,6 +3,8 @@
 namespace common\jobs;
 
 use common\enums\ProductFamily;
+use common\models\Brand;
+use common\services\BrandResolverService;
 use common\services\ImportStagingService;
 use yii\base\BaseObject;
 use yii\queue\JobInterface;
@@ -148,8 +150,14 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
         $model = $data['model'] ?? $data['name'] ?? '';
         $category = $data['category_path'] ?? '';
 
-        // 1. Нормализация бренда
-        $canonicalBrand = $this->normalizeBrand($brand, $brandMapping);
+        // 1. Нормализация бренда через BrandResolverService (Sprint 22)
+        /** @var BrandResolverService $brandResolver */
+        $brandResolver = Yii::$app->get('brandResolver');
+        $resolvedBrand = $brandResolver->resolve($brand);
+        
+        // Сохраняем эталонный brand_id и каноническое название
+        $canonicalBrand = $resolvedBrand ? $resolvedBrand->name : $this->normalizeBrand($brand, $brandMapping);
+        $brandId = $resolvedBrand ? $resolvedBrand->id : null;
 
         // 2. Маппинг категории
         $categoryMapped = $this->normalizeCategory($category, $categoryMapping);
@@ -163,6 +171,7 @@ class NormalizeStagedJob extends BaseObject implements JobInterface
         return [
             '_canonical_name'  => $canonicalName,
             '_brand_canonical' => $canonicalBrand,
+            '_brand_id'        => $brandId, // Эталонный brand_id (Sprint 22)
             '_category_mapped' => $categoryMapped,
             '_product_type'    => $productType,
             '_product_family'  => ProductFamily::detect($canonicalName . ' ' . $category)->value,

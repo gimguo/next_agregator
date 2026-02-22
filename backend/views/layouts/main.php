@@ -132,6 +132,11 @@ $isGuest = Yii::$app->user->isGuest;
                         <i class="fas fa-building"></i>
                         <span>Поставщики</span>
                     </a>
+                    <a href="<?= Url::to(['/brand/index']) ?>"
+                       class="pim-nav-item <?= $controller === 'brand' ? 'active' : '' ?>">
+                        <i class="fas fa-tags"></i>
+                        <span>Бренды</span>
+                    </a>
                     <a href="<?= Url::to(['/supplier-fetch-config/index']) ?>"
                        class="pim-nav-item <?= $controller === 'supplier-fetch-config' ? 'active' : '' ?>">
                         <i class="fas fa-cloud-arrow-down"></i>

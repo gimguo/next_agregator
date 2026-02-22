@@ -55,6 +55,7 @@ class ProductModel extends ActiveRecord
             [['meta_title'], 'string', 'max' => 500],
             [['description', 'short_description', 'meta_description'], 'string'],
             [['brand_id', 'category_id', 'supplier_count', 'variant_count', 'offer_count', 'quality_score', 'legacy_card_id'], 'integer'],
+            [['brand_id'], 'exist', 'skipOnError' => true, 'targetClass' => Brand::class, 'targetAttribute' => ['brand_id' => 'id']],
             [['best_price', 'price_range_min', 'price_range_max'], 'number'],
             [['is_in_stock', 'is_published'], 'boolean'],
             [['slug'], 'unique'],
