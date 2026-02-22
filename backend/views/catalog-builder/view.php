@@ -73,7 +73,7 @@ $formatRules = function ($rules) {
 };
 
 // Функция для рекурсивного вывода категорий
-$renderCategory = function ($catId) use (&$renderCategory, $categoryTree, $productsByCategory, $formatRules) {
+$renderCategory = function ($catId) use (&$renderCategory, $categoryTree, $productsByCategory, $formatRules, $preview) {
     $node = $categoryTree[$catId] ?? null;
     if (!$node) return '';
     
@@ -85,12 +85,33 @@ $renderCategory = function ($catId) use (&$renderCategory, $categoryTree, $produ
     $rules = $cat['rules'] ?? null;
     $rulesText = $formatRules($rules);
     
+    // Формируем ссылку на товары категории (только если есть товары)
+    $categoryUrl = null;
+    if ($productCount > 0) {
+        $categoryUrl = Url::to([
+            '/catalog-builder/category-products',
+            'preview_id' => $preview->id,
+            'category_id' => $catId,
+        ]);
+    }
+    
     $html = '<li class="category-item mb-2">';
     $html .= '<div class="d-flex align-items-center justify-content-between p-2" style="background:var(--bg-elevated);border-radius:6px;border:1px solid var(--border)">';
     $html .= '<div class="flex-grow-1">';
     $html .= '<div class="d-flex align-items-center mb-1">';
     $html .= '<i class="fas fa-folder me-2" style="color:var(--accent);font-size:.85rem"></i>';
-    $html .= '<strong style="font-size:.9rem">' . Html::encode($name) . '</strong>';
+    
+    // Название категории — ссылка, если есть товары
+    if ($categoryUrl) {
+        $html .= Html::a(
+            '<strong style="font-size:.9rem">' . Html::encode($name) . '</strong>',
+            $categoryUrl,
+            ['style' => 'color:var(--accent);text-decoration:none;font-weight:600']
+        );
+    } else {
+        $html .= '<strong style="font-size:.9rem">' . Html::encode($name) . '</strong>';
+    }
+    
     if ($slug) {
         $html .= ' <code style="font-size:.7rem;margin-left:8px;color:var(--text-muted)">' . Html::encode($slug) . '</code>';
     }
@@ -101,7 +122,18 @@ $renderCategory = function ($catId) use (&$renderCategory, $categoryTree, $produ
         $html .= '</div>';
     }
     $html .= '</div>';
-    $html .= '<span class="badge bg-info ms-2" style="font-size:.75rem;font-weight:600">' . number_format($productCount) . '</span>';
+    
+    // Бейдж с количеством товаров — ссылка, если есть товары
+    if ($categoryUrl) {
+        $html .= Html::a(
+            '<span class="badge bg-info ms-2" style="font-size:.75rem;font-weight:600;cursor:pointer">' . number_format($productCount) . '</span>',
+            $categoryUrl,
+            ['style' => 'text-decoration:none']
+        );
+    } else {
+        $html .= '<span class="badge bg-secondary ms-2" style="font-size:.75rem;font-weight:600">' . number_format($productCount) . '</span>';
+    }
+    
     $html .= '</div>';
     
     if (!empty($children)) {

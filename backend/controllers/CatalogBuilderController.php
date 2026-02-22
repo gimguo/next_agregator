@@ -5,6 +5,8 @@ namespace backend\controllers;
 use common\models\CatalogExport;
 use common\models\CatalogPreview;
 use common\models\CatalogTemplate;
+use common\models\ModelChannelReadiness;
+use common\models\ProductModel;
 use common\models\SalesChannel;
 use common\models\Supplier;
 use common\services\CatalogBuilderService;
@@ -147,6 +149,67 @@ class CatalogBuilderController extends Controller
             'categories' => $categories,
             'productsByCategory' => $productsByCategory,
             'suppliers' => $suppliers,
+        ]);
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * CATEGORY PRODUCTS — Просмотр товаров категории (Drill-down)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    public function actionCategoryProducts(int $preview_id, string $category_id): string
+    {
+        $preview = $this->findPreview($preview_id);
+        $previewData = $preview->getPreviewDataArray();
+        $productsByCategory = $previewData['products_by_category'] ?? [];
+
+        // Получаем ID товаров для категории
+        $modelIds = $productsByCategory[$category_id] ?? [];
+        if (empty($modelIds)) {
+            Yii::$app->session->setFlash('warning', 'В этой категории нет товаров.');
+            return $this->redirect(['view', 'id' => $preview_id]);
+        }
+
+        // Находим название категории
+        $categoryName = 'Неизвестная категория';
+        $categories = $previewData['categories'] ?? [];
+        foreach ($categories as $cat) {
+            if (($cat['id'] ?? null) == $category_id || ($cat['id'] ?? null) === $category_id) {
+                $categoryName = $cat['name'] ?? 'Неизвестная категория';
+                break;
+            }
+        }
+        if ($category_id === 'orphan') {
+            $categoryName = 'Прочее (Не распределено)';
+        }
+
+        // Получаем активный канал для Readiness
+        $channel = SalesChannel::find()->where(['is_active' => true])->one();
+        $readinessMap = [];
+        if ($channel) {
+            $readinessRecords = ModelChannelReadiness::find()
+                ->where(['model_id' => $modelIds, 'channel_id' => $channel->id])
+                ->indexBy('model_id')
+                ->all();
+            foreach ($readinessRecords as $record) {
+                $readinessMap[$record->model_id] = $record;
+            }
+        }
+
+        // Создаём DataProvider
+        $dataProvider = new ActiveDataProvider([
+            'query' => ProductModel::find()->where(['id' => $modelIds]),
+            'pagination' => ['pageSize' => 50],
+            'sort' => [
+                'defaultOrder' => ['id' => SORT_ASC],
+            ],
+        ]);
+
+        return $this->render('category-products', [
+            'preview' => $preview,
+            'categoryId' => $category_id,
+            'categoryName' => $categoryName,
+            'dataProvider' => $dataProvider,
+            'readinessMap' => $readinessMap,
         ]);
     }
 

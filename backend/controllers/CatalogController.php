@@ -11,6 +11,7 @@ use common\models\ProductModel;
 use common\models\ReferenceVariant;
 use common\models\SalesChannel;
 use common\models\SupplierOffer;
+use common\jobs\HealModelJob;
 use common\services\AutoHealingService;
 use common\services\GoldenRecordService;
 use common\services\OutboxService;
@@ -54,6 +55,7 @@ class CatalogController extends Controller
                     'sync'      => ['post'],
                     'heal'      => ['post'],
                     'heal-ajax' => ['post'],
+                    'bulk'      => ['post'],
                 ],
             ],
         ];
@@ -576,5 +578,104 @@ class CatalogController extends Controller
             }
         }
         return null;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * BULK — Массовые действия (Sprint 21)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    public function actionBulk(): Response
+    {
+        $request = Yii::$app->request;
+        $action = $request->post('action');
+        $modelIdsStr = $request->post('model_ids', '');
+
+        if (empty($action) || empty($modelIdsStr)) {
+            return $this->asJson([
+                'success' => false,
+                'message' => 'Не указано действие или товары',
+            ]);
+        }
+
+        $modelIds = array_filter(array_map('intval', explode(',', $modelIdsStr)));
+        if (empty($modelIds)) {
+            return $this->asJson([
+                'success' => false,
+                'message' => 'Не указаны ID товаров',
+            ]);
+        }
+
+        $channel = SalesChannel::find()->where(['is_active' => true])->one();
+        if (!$channel) {
+            return $this->asJson([
+                'success' => false,
+                'message' => 'Нет активного канала продаж',
+            ]);
+        }
+
+        $processed = 0;
+        $errors = [];
+
+        try {
+            switch ($action) {
+                case 'heal':
+                    // Массовое AI-лечение: отправляем в очередь
+                    foreach ($modelIds as $modelId) {
+                        try {
+                            Yii::$app->queue->push(new HealModelJob([
+                                'modelId' => $modelId,
+                                'channelId' => $channel->id,
+                            ]));
+                            $processed++;
+                        } catch (\Throwable $e) {
+                            $errors[] = "Модель #{$modelId}: {$e->getMessage()}";
+                            Yii::error("Bulk heal error for model #{$modelId}: {$e->getMessage()}", 'catalog.bulk');
+                        }
+                    }
+
+                    return $this->asJson([
+                        'success' => true,
+                        'message' => "{$processed} товаров отправлено на лечение ИИ" . (!empty($errors) ? '. Ошибок: ' . count($errors) : ''),
+                    ]);
+
+                case 'recalculate-readiness':
+                    // Принудительно пересчитать Readiness
+                    /** @var ReadinessScoringService $scorer */
+                    $scorer = Yii::$app->get('readinessService');
+
+                    foreach ($modelIds as $modelId) {
+                        try {
+                            $model = ProductModel::findOne($modelId);
+                            if (!$model) {
+                                $errors[] = "Модель #{$modelId} не найдена";
+                                continue;
+                            }
+
+                            $scorer->evaluate($modelId, $channel, true);
+                            $processed++;
+                        } catch (\Throwable $e) {
+                            $errors[] = "Модель #{$modelId}: {$e->getMessage()}";
+                            Yii::error("Bulk recalculate-readiness error for model #{$modelId}: {$e->getMessage()}", 'catalog.bulk');
+                        }
+                    }
+
+                    return $this->asJson([
+                        'success' => true,
+                        'message' => "Readiness пересчитан для {$processed} товаров" . (!empty($errors) ? '. Ошибок: ' . count($errors) : ''),
+                    ]);
+
+                default:
+                    return $this->asJson([
+                        'success' => false,
+                        'message' => "Неизвестное действие: {$action}",
+                    ]);
+            }
+        } catch (\Throwable $e) {
+            Yii::error("Bulk action error: {$e->getMessage()}", 'catalog.bulk');
+            return $this->asJson([
+                'success' => false,
+                'message' => "Ошибка выполнения: {$e->getMessage()}",
+            ]);
+        }
     }
 }
