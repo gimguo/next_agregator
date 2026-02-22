@@ -13,10 +13,11 @@ use yii\helpers\Url;
 $this->title = 'MDM Каталог — Модели товаров';
 $this->params['breadcrumbs'][] = 'MDM Каталог';
 
-// Prefetch thumbnails for all models on this page to avoid N+1 queries
+// Prefetch thumbnails, readiness for all models on this page to avoid N+1 queries
 $modelIds = array_map(fn($m) => $m->id, $dataProvider->getModels());
 $thumbMap = [];
 $photoCountMap = [];
+$readinessMap = [];
 if (!empty($modelIds)) {
     $inSql = implode(',', $modelIds);
     // Primary/first image per model
@@ -42,6 +43,21 @@ if (!empty($modelIds)) {
     ")->queryAll();
     foreach ($counts as $c) {
         $photoCountMap[(int)$c['entity_id']] = ['total' => (int)$c['total'], 'ready' => (int)$c['ready']];
+    }
+    // Readiness scores (для активного канала по умолчанию)
+    $channel = \common\models\SalesChannel::find()->where(['is_active' => true])->one();
+    if ($channel) {
+        $readinessRows = Yii::$app->db->createCommand("
+            SELECT model_id, score, is_ready
+            FROM {{%model_channel_readiness}}
+            WHERE model_id IN ({$inSql}) AND channel_id = :channel_id
+        ", [':channel_id' => $channel->id])->queryAll();
+        foreach ($readinessRows as $r) {
+            $readinessMap[(int)$r['model_id']] = [
+                'score' => (int)$r['score'],
+                'is_ready' => (bool)$r['is_ready'],
+            ];
+        }
     }
 }
 ?>
@@ -81,7 +97,11 @@ if (!empty($modelIds)) {
                                     . 'style="width:42px;height:42px;object-fit:cover;border-radius:6px;border:1px solid var(--border)">'
                                     . '</a>';
                             }
-                            return '<div style="width:42px;height:42px;border-radius:6px;background:var(--bg-body);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text-secondary);font-size:.6rem">IMG</div>';
+                            return '<a href="' . Url::to(['catalog/view', 'id' => $model->id]) . '">'
+                                . '<div style="width:42px;height:42px;border-radius:6px;background:var(--bg-body);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text-muted)">'
+                                . '<i class="fas fa-image" style="font-size:1rem;opacity:0.3"></i>'
+                                . '</div>'
+                                . '</a>';
                         },
                     ],
                     [
@@ -94,6 +114,7 @@ if (!empty($modelIds)) {
                             'topper' => 'Топпер',
                             'blanket' => 'Одеяло',
                             'base' => 'Основание',
+                            'unknown' => 'Unknown',
                         ],
                         'format' => 'raw',
                         'value' => function ($model) {
@@ -104,9 +125,13 @@ if (!empty($modelIds)) {
                                 'topper' => 'Топпер',
                                 'blanket' => 'Одеяло',
                                 'base' => 'Основание',
+                                'unknown' => 'Unknown',
                             ];
-                            return '<span class="badge-status badge-partial" style="font-size:.7rem">'
-                                . Html::encode($labels[$model->product_family] ?? $model->product_family)
+                            $family = $model->product_family ?? 'unknown';
+                            $label = $labels[$family] ?? $family;
+                            $badgeClass = ($family === 'unknown') ? 'badge-draft' : 'badge-partial';
+                            return '<span class="badge-status ' . $badgeClass . '" style="font-size:.7rem">'
+                                . Html::encode($label)
                                 . '</span>';
                         },
                         'headerOptions' => ['style' => 'width:100px'],
@@ -153,6 +178,28 @@ if (!empty($modelIds)) {
                                 return '<span class="badge-status ' . $cls . '">' . $pc['ready'] . '/' . $pc['total'] . '</span>';
                             }
                             return '<span style="color:var(--text-secondary)">0</span>';
+                        },
+                    ],
+                    [
+                        'label' => 'Готовность',
+                        'format' => 'raw',
+                        'headerOptions' => ['style' => 'width:100px;text-align:center'],
+                        'contentOptions' => ['style' => 'text-align:center'],
+                        'value' => function ($model) use ($readinessMap) {
+                            $r = $readinessMap[$model->id] ?? null;
+                            if (!$r) {
+                                return '<span class="badge bg-secondary" style="font-size:.7rem">—</span>';
+                            }
+                            $score = $r['score'];
+                            $isReady = $r['is_ready'];
+                            if ($isReady || $score >= 100) {
+                                $cls = 'bg-success';
+                            } elseif ($score >= 50) {
+                                $cls = 'bg-warning';
+                            } else {
+                                $cls = 'bg-danger';
+                            }
+                            return '<span class="badge ' . $cls . '" style="font-size:.7rem;font-weight:600">' . $score . '%</span>';
                         },
                     ],
                     [

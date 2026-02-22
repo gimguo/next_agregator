@@ -96,9 +96,9 @@ $isGuest = Yii::$app->user->isGuest;
                 </div>
 
                 <div class="pim-nav-section">
-                    <div class="pim-nav-section-label">Каталог</div>
+                    <div class="pim-nav-section-label">КАТАЛОГ</div>
                     <a href="<?= Url::to(['/catalog/index']) ?>"
-                       class="pim-nav-item <?= $controller === 'catalog' && $action !== 'cards' && $controller !== 'catalog-builder' ? 'active' : '' ?>">
+                       class="pim-nav-item <?= $controller === 'catalog' && $controller !== 'catalog-builder' ? 'active' : '' ?>">
                         <i class="fas fa-database"></i>
                         <span>MDM Модели</span>
                         <?php
@@ -107,11 +107,6 @@ $isGuest = Yii::$app->user->isGuest;
                             echo '<span class="pim-nav-badge">' . number_format($modelCount) . '</span>';
                         } catch (\Exception $e) {}
                         ?>
-                    </a>
-                    <a href="<?= Url::to(['/catalog/cards']) ?>"
-                       class="pim-nav-item <?= $controller === 'catalog' && $action === 'cards' ? 'active' : '' ?>">
-                        <i class="fas fa-id-card"></i>
-                        <span>Карточки товаров</span>
                     </a>
                     <a href="<?= Url::to(['/catalog-builder/index']) ?>"
                        class="pim-nav-item <?= $controller === 'catalog-builder' ? 'active' : '' ?>">
@@ -126,7 +121,7 @@ $isGuest = Yii::$app->user->isGuest;
                 </div>
 
                 <div class="pim-nav-section">
-                    <div class="pim-nav-section-label">Данные</div>
+                    <div class="pim-nav-section-label">ДАННЫЕ</div>
                     <a href="<?= Url::to(['/supplier/index']) ?>"
                        class="pim-nav-item <?= $controller === 'supplier' ? 'active' : '' ?>">
                         <i class="fas fa-building"></i>
@@ -135,22 +130,22 @@ $isGuest = Yii::$app->user->isGuest;
                     <a href="<?= Url::to(['/supplier-fetch-config/index']) ?>"
                        class="pim-nav-item <?= $controller === 'supplier-fetch-config' ? 'active' : '' ?>">
                         <i class="fas fa-clock-rotate-left"></i>
-                        <span>Авто-забор</span>
+                        <span>Сборщик прайсов</span>
                     </a>
                     <a href="<?= Url::to(['/staging-ui/index']) ?>"
                        class="pim-nav-item <?= $controller === 'staging-ui' ? 'active' : '' ?>">
                         <i class="fas fa-layer-group"></i>
-                        <span>Staging</span>
+                        <span>Сырые данные</span>
                     </a>
                     <a href="<?= Url::to(['/media-ui/index']) ?>"
                        class="pim-nav-item <?= $controller === 'media-ui' ? 'active' : '' ?>">
                         <i class="fas fa-images"></i>
-                        <span>Медиа (S3)</span>
+                        <span>Медиа</span>
                     </a>
                 </div>
 
                 <div class="pim-nav-section">
-                    <div class="pim-nav-section-label">Экспорт & Качество</div>
+                    <div class="pim-nav-section-label">ЭКСПОРТ & КАЧЕСТВО</div>
                     <a href="<?= Url::to(['/outbox-ui/index']) ?>"
                        class="pim-nav-item <?= $controller === 'outbox-ui' ? 'active' : '' ?>">
                         <i class="fas fa-paper-plane"></i>
@@ -164,7 +159,7 @@ $isGuest = Yii::$app->user->isGuest;
                 </div>
 
                 <div class="pim-nav-section">
-                    <div class="pim-nav-section-label">Система</div>
+                    <div class="pim-nav-section-label">СИСТЕМА</div>
                     <a href="<?= Url::to(['/queue-dashboard/index']) ?>"
                        class="pim-nav-item <?= $controller === 'queue-dashboard' ? 'active' : '' ?>">
                         <i class="fas fa-list-check"></i>
